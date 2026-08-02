@@ -18,6 +18,15 @@
 
 同时提供标签文件和若干示例图，下载完整仓库即可编译和使用；无需再单独获取模型。
 
+## 架构图
+
+最新架构图位于 [`docs/architecture`](docs/architecture)：
+
+- [系统整体架构](docs/architecture/system-architecture.png)
+- [Navigation Mesh 构建流程](docs/architecture/navigation-mesh-construction.png)
+- [目标传染导航算法流程](docs/architecture/contagion-navigation-flow.png)
+- [连续导航状态机](docs/architecture/continuous-navigation-state-machine.png)
+
 ## 注意事项
 
 - 运行后需要在系统设置中为应用启用无障碍服务，并按应用提示授予所需权限。
