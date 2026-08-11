@@ -184,7 +184,13 @@ internal class PersistentVisualCanvas {
         val isDirectUpdate = pending.stage != VisualUpdateStage.FUSED
 
         val matches = matchNodes(previousNodes, incomingNodes)
-        val oldMatched = matches.map { it.oldIndex }.toSet()
+        val oldMatched = matches.map { it.oldIndex }.toMutableSet()
+        val explicitlyAbsorbedIds = incomingNodes.flatMapTo(linkedSetOf()) { node ->
+            node.visualEvidence?.absorbedStableIds.orEmpty()
+        }
+        previousNodes.forEachIndexed { index, node ->
+            if (node.stableId in explicitlyAbsorbedIds) oldMatched += index
+        }
         val addedIds = linkedSetOf<String>()
         val updatedIds = linkedSetOf<String>()
         val removedIds = linkedSetOf<String>()
@@ -192,6 +198,7 @@ internal class PersistentVisualCanvas {
         val retainedMissingIds = linkedSetOf<String>()
         val nextMissing = linkedMapOf<String, Int>()
         val nextNodes = mutableListOf<NavNode>()
+        val stableIdAliases = linkedMapOf<String, String>()
 
         val matchByNew = matches.associateBy { it.newIndex }
         incomingNodes.forEachIndexed { newIndex, observed ->
@@ -202,8 +209,12 @@ internal class PersistentVisualCanvas {
                     bounds = Rect(observed.bounds),
                     centerX = observed.bounds.exactCenterX(),
                     centerY = observed.bounds.exactCenterY(),
-                    stableId = stableId
+                    stableId = stableId,
+                    interactionBounds = observed.interactionBounds?.let(::Rect)
                 )
+                observed.visualEvidence?.absorbedStableIds.orEmpty().forEach { absorbedId ->
+                    if (absorbedId != stableId) stableIdAliases[absorbedId] = stableId
+                }
                 addedIds += stableId
                 nextMissing[stableId] = 0
             } else {
@@ -211,6 +222,9 @@ internal class PersistentVisualCanvas {
                 val stableId = oldNode.stableId ?: allocateStableId(pending, oldNode)
                 val stabilized = mergeMatchedNode(oldNode, observed, stableId)
                 nextNodes += stabilized
+                observed.visualEvidence?.absorbedStableIds.orEmpty().forEach { absorbedId ->
+                    if (absorbedId != stableId) stableIdAliases[absorbedId] = stableId
+                }
                 nextMissing[stableId] = 0
                 if (!NavNodeIdentity.samePayload(oldNode, stabilized)) {
                     updatedIds += stableId
@@ -222,7 +236,12 @@ internal class PersistentVisualCanvas {
         }
 
         previousNodes.forEachIndexed { oldIndex, oldNode ->
-            if (oldIndex in oldMatched) return@forEachIndexed
+            if (oldIndex in oldMatched) {
+                if (oldNode.stableId in explicitlyAbsorbedIds) {
+                    oldNode.stableId?.let(removedIds::add)
+                }
+                return@forEachIndexed
+            }
             val stableId = oldNode.stableId ?: allocateStableId(pending, oldNode)
             val previousMissed = previousMissingCounts[stableId] ?: 0
             val missed = if (isDirectUpdate) previousMissed else previousMissed + 1
@@ -236,7 +255,8 @@ internal class PersistentVisualCanvas {
                     bounds = Rect(oldNode.bounds),
                     centerX = oldNode.bounds.exactCenterX(),
                     centerY = oldNode.bounds.exactCenterY(),
-                    stableId = stableId
+                    stableId = stableId,
+                    interactionBounds = oldNode.interactionBounds?.let(::Rect)
                 )
                 nextMissing[stableId] = missed
                 retainedMissingIds += stableId
@@ -260,8 +280,14 @@ internal class PersistentVisualCanvas {
             ),
             nextMissingCounts = nextMissing,
             nextDirectObservations = nextDirectObservations.mapValues { (_, nodes) ->
-                nodes.map { it.copy(bounds = Rect(it.bounds)) }
-            }
+                nodes.map {
+                    it.copy(
+                        bounds = Rect(it.bounds),
+                        interactionBounds = it.interactionBounds?.let(::Rect)
+                    )
+                }
+            },
+            stableIdAliases = stableIdAliases
         )
         preparedUpdateValue = update
         return update
@@ -341,6 +367,8 @@ internal class PersistentVisualCanvas {
         val replacementFocus = when {
             selectedFocus?.stableId != null -> update.nodes.firstOrNull {
                 it.stableId == selectedFocus.stableId
+            } ?: update.stableIdAliases[selectedFocus.stableId]?.let { replacementId ->
+                update.nodes.firstOrNull { it.stableId == replacementId }
             }
             selectedFocus?.origin == NavNodeOrigin.VISION -> {
                 EdgeInteractionRules.closestEquivalentNode(selectedFocus, update.nodes)
@@ -411,7 +439,8 @@ internal class PersistentVisualCanvas {
         val merged = mutableListOf<NavNode>()
         nodes.forEach { observed ->
             val existingIndex = merged.indexOfFirst { existing ->
-                matchScore(existing, observed) >= MATCH_THRESHOLD
+                matchScore(existing, observed) >= MATCH_THRESHOLD ||
+                    areContainedDirectDuplicates(existing, observed)
             }
             if (existingIndex < 0) {
                 merged += observed
@@ -437,7 +466,9 @@ internal class PersistentVisualCanvas {
         val merged = fusedNodes.toMutableList()
         trustedDirectNodes.forEach { direct ->
             val existingIndex = merged.indexOfFirst { fused ->
-                matchScore(fused, direct) >= MATCH_THRESHOLD
+                direct.stableId in fused.visualEvidence?.absorbedStableIds.orEmpty() ||
+                    fusedRepresentsDirectObservation(fused, direct) ||
+                    matchScore(fused, direct) >= MATCH_THRESHOLD
             }
             if (existingIndex < 0) {
                 merged += direct
@@ -456,6 +487,19 @@ internal class PersistentVisualCanvas {
         return merged
     }
 
+    private fun fusedRepresentsDirectObservation(fused: NavNode, direct: NavNode): Boolean {
+        val relations = fused.visualEvidence?.mergeRelations.orEmpty()
+        if (relations.none {
+                it == FusionMergeRelation.CONTAINED_LABEL ||
+                    it == FusionMergeRelation.ICON_LABEL_PAIR
+            }
+        ) return false
+        if (fused.windowId != direct.windowId) return false
+        val overlap = intersectionArea(fused.bounds, direct.bounds) /
+            direct.bounds.areaLong().toFloat().coerceAtLeast(1f)
+        return overlap >= 0.78f
+    }
+
     private fun mergeMatchedNode(oldNode: NavNode, observed: NavNode, stableId: String): NavNode {
         val mergedSources = oldNode.sourceSet + observed.sourceSet
         val clickMethod = when {
@@ -465,10 +509,13 @@ internal class PersistentVisualCanvas {
             observed.clickMethod == ClickMethod.GESTURE_SAFE_LEFT -> observed.clickMethod
             else -> observed.clickMethod
         }
-        val preferredGeometry = if (isTinyGeometryJitter(oldNode, observed)) oldNode else observed
+        val preferredGeometry = preferredGeometry(oldNode, observed)
         val preferredMetadata = chooseMetadataWinner(oldNode, observed)
         val evidence = (preferredMetadata.visualEvidence ?: oldNode.visualEvidence ?: observed.visualEvidence)
             ?.copy(sources = mergedSources, clickMethod = clickMethod)
+        val interactionBounds = preferredGeometry.interactionBounds
+            ?: preferredMetadata.interactionBounds
+            ?: preferredGeometry.bounds
         return preferredMetadata.copy(
             bounds = Rect(preferredGeometry.bounds),
             centerX = preferredGeometry.bounds.exactCenterX(),
@@ -477,8 +524,40 @@ internal class PersistentVisualCanvas {
             clickMethod = clickMethod,
             sourceSet = mergedSources,
             visualEvidence = evidence,
-            stableId = stableId
+            stableId = stableId,
+            interactionBounds = Rect(interactionBounds)
         )
+    }
+
+    private fun preferredGeometry(first: NavNode, second: NavNode): NavNode {
+        val structural = structuralContainerForDirectPair(first, second)
+        if (structural != null) return structural
+        return if (isTinyGeometryJitter(first, second)) first else second
+    }
+
+    private fun areContainedDirectDuplicates(first: NavNode, second: NavNode): Boolean =
+        structuralContainerForDirectPair(first, second) != null
+
+    private fun structuralContainerForDirectPair(first: NavNode, second: NavNode): NavNode? {
+        val pairs = listOf(first to second, second to first)
+        return pairs.firstNotNullOfOrNull { (parent, label) ->
+            val parentRole = parent.visualEvidence?.role ?: TargetRole.UNKNOWN
+            val labelText = normalizedDescription(label)
+            val labelIsOcrOnly = label.sourceSet == setOf(TargetSource.OCR) &&
+                label.visualEvidence?.directEligible == true &&
+                labelText.any(Char::isLetter)
+            val parentIsStructural = parentRole in DIRECT_CONTAINER_ROLES &&
+                parent.sourceSet.any { it == TargetSource.YOLO || it == TargetSource.ACCESSIBILITY }
+            val overlap = intersectionArea(parent.bounds, label.bounds) /
+                label.bounds.areaLong().toFloat().coerceAtLeast(1f)
+            val actionNeedsOwnNode = EdgeInteractionRules.isActionableVisualText(labelText) &&
+                (parentRole == TargetRole.LIST_ITEM ||
+                    parent.bounds.areaLong() > label.bounds.areaLong() * 6L)
+            parent.takeIf {
+                labelIsOcrOnly && parentIsStructural && !actionNeedsOwnNode &&
+                    parent.bounds.areaLong() > label.bounds.areaLong() && overlap >= 0.78f
+            }
+        }
     }
 
     private fun chooseMetadataWinner(oldNode: NavNode, observed: NavNode): NavNode {
@@ -496,6 +575,7 @@ internal class PersistentVisualCanvas {
 
     private fun matchScore(oldNode: NavNode, newNode: NavNode): Float {
         if (oldNode.windowId != newNode.windowId) return 0f
+        if (oldNode.stableId != null && oldNode.stableId == newNode.stableId) return 1f
         if (!rolesCompatible(oldNode, newNode)) return 0f
         val overlap = iou(oldNode.bounds, newNode.bounds)
         val center = centerCloseness(oldNode.bounds, newNode.bounds)
@@ -565,6 +645,12 @@ internal class PersistentVisualCanvas {
         return if (unionArea <= 0f) 0f else intersectionArea / unionArea
     }
 
+    private fun intersectionArea(first: Rect, second: Rect): Long {
+        val width = (minOf(first.right, second.right) - maxOf(first.left, second.left)).coerceAtLeast(0)
+        val height = (minOf(first.bottom, second.bottom) - maxOf(first.top, second.top)).coerceAtLeast(0)
+        return width.toLong() * height.toLong()
+    }
+
     private fun allocateStableId(pending: PendingVisualCache, node: NavNode): String {
         stableSequence += 1L
         val role = node.visualEvidence?.role?.name ?: "UNKNOWN"
@@ -579,6 +665,12 @@ internal class PersistentVisualCanvas {
     }
 
     private companion object {
+        val DIRECT_CONTAINER_ROLES = setOf(
+            TargetRole.ACTION,
+            TargetRole.ICON_ENTRY,
+            TargetRole.LIST_ITEM,
+            TargetRole.RIGHT_RAIL
+        )
         const val MATCH_THRESHOLD = 0.55f
         const val JITTER_IOU_THRESHOLD = 0.82f
         const val JITTER_EDGE_TOLERANCE_PX = 7

@@ -28,6 +28,14 @@ enum class ClickMethod {
     GESTURE_SAFE_LEFT
 }
 
+/** Typed reason explaining why multiple observations became one navigation target. */
+enum class FusionMergeRelation {
+    OVERLAP_DUPLICATE,
+    CONTAINED_LABEL,
+    ICON_LABEL_PAIR,
+    KEEP_INNER_ACTION
+}
+
 /**
  * Typed visual evidence. Fusion must consume these fields instead of parsing
  * display-only description strings.
@@ -40,7 +48,10 @@ data class VisualTargetEvidence(
     val role: TargetRole,
     val score: Int,
     val clickMethod: ClickMethod,
-    val directEligible: Boolean
+    val directEligible: Boolean,
+    val mergeRelations: Set<FusionMergeRelation> = emptySet(),
+    /** Stable identities replaced by this fused observation. */
+    val absorbedStableIds: Set<String> = emptySet()
 )
 
 internal data class CandidateTarget(
@@ -58,7 +69,9 @@ internal data class CandidateTarget(
     val rawType: String,
     val evidence: VisualTargetEvidence? = node.visualEvidence,
     /** 当前候选建议的点击执行策略。 */
-    val clickMethod: ClickMethod = node.clickMethod
+    val clickMethod: ClickMethod = node.clickMethod,
+    val mergeRelations: Set<FusionMergeRelation> = evidence?.mergeRelations.orEmpty(),
+    val absorbedStableIds: Set<String> = evidence?.absorbedStableIds.orEmpty()
 )
 
 internal data class FinalTarget(
@@ -103,7 +116,11 @@ internal data class TargetFusionStats(
     val ocrInputCount: Int = 0,
     val fusionInputCount: Int = 0,
     val listItemInputCount: Int = 0,
-    val listItemFinalCount: Int = 0
+    val listItemFinalCount: Int = 0,
+    val containedLabelMergeCount: Int = 0,
+    val iconLabelPairCount: Int = 0,
+    val keptInnerActionCount: Int = 0,
+    val overlapDuplicateCount: Int = 0
 )
 
 internal data class TargetFusionResult(

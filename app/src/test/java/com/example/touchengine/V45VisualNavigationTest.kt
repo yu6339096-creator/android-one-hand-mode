@@ -143,7 +143,7 @@ class V45VisualNavigationTest {
 
         val rows = nodes.filter { it.visualEvidence?.role == TargetRole.LIST_ITEM }
         assertEquals(3, rows.size)
-        assertTrue(rows.any { it.description == "微信聊天项" })
+        assertTrue(rows.any { it.visualEvidence?.ocrText == "微信聊天项" })
         assertTrue(rows.all { it.clickMethod == ClickMethod.GESTURE_SAFE_LEFT })
     }
 

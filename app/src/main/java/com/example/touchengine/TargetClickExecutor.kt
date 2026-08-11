@@ -44,7 +44,7 @@ internal class TargetClickExecutor(
 
     private fun performAccessibilityClick(target: NavNode): TargetClickResult {
         val root = host.obtainPrimaryContentRoot()
-        val native = root?.let { findNativeNodeByBounds(it, target.bounds) }
+        val native = root?.let { findNativeNodeByBounds(it, target.interactionBounds ?: target.bounds) }
         try {
             if (native != null && native.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                 return TargetClickResult(
@@ -117,7 +117,7 @@ internal class TargetClickExecutor(
     }
 
     private fun clickPointForTarget(target: NavNode, method: ClickMethod): Pair<Float, Float> {
-        val bounds = target.bounds
+        val bounds = target.interactionBounds ?: target.bounds
         val rawX = when (method) {
             ClickMethod.GESTURE_SAFE_LEFT -> bounds.left + bounds.width() * 0.38f
             else -> bounds.exactCenterX()

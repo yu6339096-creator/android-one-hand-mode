@@ -36,6 +36,10 @@
 - [目标传染导航算法流程（中文）](docs/architecture/contagion-navigation-flow-zh-cn.png)
 - [连续导航状态机（中文）](docs/architecture/continuous-navigation-state-machine-zh-cn.jpg)
 
+## 更新说明
+
+- [2026-08-12：融合引擎重叠消除与图标标签合并（中文 / 日本語）](docs/updates/2026-08-12-fusion-overlap/README.md)
+
 ## 注意事项
 
 - 运行后需要在系统设置中为应用启用无障碍服务，并按应用提示授予所需权限。

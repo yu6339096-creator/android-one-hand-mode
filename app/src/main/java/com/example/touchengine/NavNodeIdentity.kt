@@ -37,7 +37,8 @@ internal object NavNodeIdentity {
             first.origin == second.origin &&
             first.clickMethod == second.clickMethod &&
             first.sourceSet == second.sourceSet &&
-            first.visualEvidence == second.visualEvidence
+            first.visualEvidence == second.visualEvidence &&
+            first.interactionBounds == second.interactionBounds
     }
 
     fun sameGeometry(first: NavNode, second: NavNode): Boolean {
@@ -55,7 +56,8 @@ internal object NavNodeIdentity {
             clickMethod = node.clickMethod,
             sourceSet = node.sourceSet,
             visualEvidence = node.visualEvidence,
-            stableId = node.stableId
+            stableId = node.stableId,
+            interactionBounds = node.interactionBounds?.let(::Rect)
         )
     }
 

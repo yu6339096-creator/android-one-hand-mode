@@ -153,5 +153,7 @@ internal data class VisualCanvasUpdate(
     val patch: VisualCanvasPatch,
     val nextMissingCounts: Map<String, Int>,
     /** 未完成融合前，分别保留两条快速路径的观察，避免互相覆盖。 */
-    val nextDirectObservations: Map<VisualUpdateStage, List<NavNode>>
+    val nextDirectObservations: Map<VisualUpdateStage, List<NavNode>>,
+    /** Old direct stableId -> surviving fused stableId. */
+    val stableIdAliases: Map<String, String> = emptyMap()
 )

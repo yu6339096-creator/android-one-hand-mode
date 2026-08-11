@@ -11,6 +11,12 @@ import kotlin.math.roundToInt
  * 所有页面状态都由 [TargetFusionContext] 以一次快照的形式传入。
  */
 internal class TargetFusionEngine {
+    private val CONTAINED_LABEL_PARENT_ROLES = setOf(
+        TargetRole.ACTION,
+        TargetRole.ICON_ENTRY,
+        TargetRole.LIST_ITEM,
+        TargetRole.RIGHT_RAIL
+    )
     private val STRONG_YOLO_CLASSES = setOf(
         "bottomnavigation",
         "checkbox",
@@ -70,6 +76,9 @@ internal class TargetFusionEngine {
         val fusionInputCount = rawCandidates.count { TargetSource.VISUAL_FUSION in it.sourceSet }
         val listItemInputCount = rawCandidates.count { it.role == TargetRole.LIST_ITEM }
         val listItemFinalCount = selected.count { it.role == TargetRole.LIST_ITEM }
+        val mergeRelations = selected.flatMap { target ->
+            target.node.visualEvidence?.mergeRelations.orEmpty()
+        }
 
         return TargetFusionResult(
             nodes = finalNodes,
@@ -87,7 +96,11 @@ internal class TargetFusionEngine {
                 ocrInputCount = ocrInputCount,
                 fusionInputCount = fusionInputCount,
                 listItemInputCount = listItemInputCount,
-                listItemFinalCount = listItemFinalCount
+                listItemFinalCount = listItemFinalCount,
+                containedLabelMergeCount = mergeRelations.count { it == FusionMergeRelation.CONTAINED_LABEL },
+                iconLabelPairCount = mergeRelations.count { it == FusionMergeRelation.ICON_LABEL_PAIR },
+                keptInnerActionCount = mergeRelations.count { it == FusionMergeRelation.KEEP_INNER_ACTION },
+                overlapDuplicateCount = mergeRelations.count { it == FusionMergeRelation.OVERLAP_DUPLICATE }
             )
         )
     }
@@ -136,16 +149,41 @@ internal class TargetFusionEngine {
                 .thenByDescending { it.confidence }
                 .thenBy { it.node.bounds.areaLong() }
         ).first()
+        val geometryWinner = when {
+            containsMost(first.node.bounds, second.node.bounds, 0.78f) -> first
+            containsMost(second.node.bounds, first.node.bounds, 0.78f) -> second
+            else -> winner
+        }
         val mergedSources = first.sourceSet + second.sourceSet
-        val mergedMethod = resolveFinalClickMethod(first, second, winner, mergedSources)
+        val mergedMethod = resolveFinalClickMethod(first, second, geometryWinner, mergedSources)
+        val survivorStableId = geometryWinner.node.stableId ?: winner.node.stableId
+        val absorbedStableIds = buildSet {
+            addAll(first.node.visualEvidence?.absorbedStableIds.orEmpty())
+            addAll(second.node.visualEvidence?.absorbedStableIds.orEmpty())
+            first.node.stableId?.let(::add)
+            second.node.stableId?.let(::add)
+            survivorStableId?.let(::remove)
+        }
+        val mergedRelations = first.node.visualEvidence?.mergeRelations.orEmpty() +
+            second.node.visualEvidence?.mergeRelations.orEmpty() +
+            FusionMergeRelation.OVERLAP_DUPLICATE
+        val preferredEvidence = geometryWinner.node.visualEvidence
+            ?: winner.node.visualEvidence
+            ?: first.node.visualEvidence
+            ?: second.node.visualEvidence
         return winner.copy(
-            node = winner.node.copy(
+            node = geometryWinner.node.copy(
                 clickMethod = mergedMethod,
                 sourceSet = mergedSources,
-                visualEvidence = winner.node.visualEvidence?.copy(
+                visualEvidence = preferredEvidence?.copy(
                     sources = mergedSources,
-                    clickMethod = mergedMethod
-                )
+                    clickMethod = mergedMethod,
+                    mergeRelations = mergedRelations,
+                    absorbedStableIds = absorbedStableIds
+                ),
+                stableId = survivorStableId,
+                interactionBounds = geometryWinner.node.interactionBounds?.let(::Rect)
+                    ?: Rect(geometryWinner.node.bounds)
             ),
             sourceSet = mergedSources,
             clickMethod = mergedMethod,
@@ -183,6 +221,7 @@ internal class TargetFusionEngine {
         second: FinalTarget
     ): Boolean {
         if (first.node.windowId != second.node.windowId) return false
+        if (keptInnerActionPair(first.node, second.node)) return false
         if (!sameFinalCompetitionFamily(first.role, second.role)) return false
         val a = first.node.bounds
         val b = second.node.bounds
@@ -242,12 +281,18 @@ internal class TargetFusionEngine {
                 sources = target.sourceSet,
                 clickMethod = target.clickMethod
             ),
-            stableId = node.stableId
+            stableId = node.stableId,
+            interactionBounds = node.interactionBounds?.let(::Rect)
         )
     }
 
     private fun intersectionArea(first: Rect, second: Rect): Long =
         intersectionWidth(first, second).toLong() * intersectionHeight(first, second).toLong()
+
+    private fun overlapOverSmaller(first: Rect, second: Rect): Float {
+        val smallerArea = minOf(first.areaLong(), second.areaLong()).coerceAtLeast(1L)
+        return intersectionArea(first, second) / smallerArea.toFloat()
+    }
 
     private fun navNodeToCandidateTarget(node: NavNode): CandidateTarget? {
         val bounds = Rect(node.bounds)
@@ -499,7 +544,9 @@ internal class TargetFusionEngine {
         candidates: List<CandidateTarget>,
         context: TargetFusionContext
     ): List<CandidateTarget> {
-        val ordered = candidates.sortedWith(
+        val containedLabelsMerged = absorbContainedOcrLabels(candidates, context)
+        val iconLabelsMerged = mergeIconLabelPairs(containedLabelsMerged, context)
+        val ordered = iconLabelsMerged.sortedWith(
             compareByDescending<CandidateTarget> { candidatePriorityHint(it, context) }
                 .thenByDescending { it.confidence }
                 .thenBy { it.bounds.top }
@@ -516,13 +563,214 @@ internal class TargetFusionEngine {
                 kept[overlappingIndex] = mergeCandidatePair(
                     kept[overlappingIndex],
                     candidate,
-                    context
+                    context,
+                    FusionMergeRelation.OVERLAP_DUPLICATE
                 )
             }
         }
         return suppressWeChatRowFragments(
             suppressOverlappingVisualCards(kept, context),
             context
+        )
+    }
+
+    private fun absorbContainedOcrLabels(
+        candidates: List<CandidateTarget>,
+        context: TargetFusionContext
+    ): List<CandidateTarget> {
+        if (candidates.size < 2) return candidates
+        val assignments = linkedMapOf<Int, MutableList<Int>>()
+        val keptInnerActions = linkedSetOf<Int>()
+
+        candidates.forEachIndexed { labelIndex, label ->
+            if (!isPairableOcrLabel(label)) return@forEachIndexed
+            val possibleParents = candidates.mapIndexedNotNull { parentIndex, parent ->
+                if (parentIndex == labelIndex || !isContainedLabelParent(parent, label)) {
+                    return@mapIndexedNotNull null
+                }
+                parentIndex to parent
+            }.sortedWith(
+                compareBy<Pair<Int, CandidateTarget>> { it.second.bounds.areaLong() }
+                    .thenByDescending { candidatePriorityHint(it.second, context) }
+            )
+            val parentEntry = possibleParents.firstOrNull() ?: return@forEachIndexed
+            if (shouldKeepIndependentInnerAction(parentEntry.second, label, context)) {
+                keptInnerActions += labelIndex
+            } else {
+                assignments.getOrPut(parentEntry.first) { mutableListOf() } += labelIndex
+            }
+        }
+
+        if (assignments.isEmpty() && keptInnerActions.isEmpty()) return candidates
+        val absorbedLabelIndices = assignments.values.flatten().toSet()
+        return candidates.mapIndexedNotNull { index, candidate ->
+            when {
+                index in absorbedLabelIndices -> null
+                index in assignments -> {
+                    val labels = assignments.getValue(index).map(candidates::get)
+                    val bestText = labels.sortedWith(
+                        compareByDescending<CandidateTarget> { semanticLabelScore(it.text.orEmpty()) }
+                            .thenBy { it.bounds.top }
+                            .thenBy { it.bounds.left }
+                    ).firstNotNullOfOrNull { it.text?.takeIf(String::isNotBlank) }
+                    labels.fold(candidate) { merged, label ->
+                        mergeCandidatePair(
+                            merged,
+                            label,
+                            context,
+                            FusionMergeRelation.CONTAINED_LABEL,
+                            geometryOwner = merged,
+                            forcedText = bestText,
+                            forcedRole = merged.role
+                        )
+                    }
+                }
+                index in keptInnerActions -> candidate.withMergeRelation(FusionMergeRelation.KEEP_INNER_ACTION)
+                else -> candidate
+            }
+        }
+    }
+
+    private data class IconLabelMatch(
+        val iconIndex: Int,
+        val labelIndex: Int,
+        val cost: Float
+    )
+
+    private fun mergeIconLabelPairs(
+        candidates: List<CandidateTarget>,
+        context: TargetFusionContext
+    ): List<CandidateTarget> {
+        if (candidates.size < 2) return candidates
+        val iconIndices = candidates.indices.filter { isPairableIcon(candidates[it]) }
+        val labelIndices = candidates.indices.filter { isPairableOcrLabel(candidates[it]) }
+        if (iconIndices.isEmpty() || labelIndices.isEmpty()) return candidates
+
+        val matches = iconIndices.flatMap { iconIndex ->
+            labelIndices.mapNotNull { labelIndex ->
+                iconLabelCost(candidates[iconIndex], candidates[labelIndex], context)?.let { cost ->
+                    IconLabelMatch(iconIndex, labelIndex, cost)
+                }
+            }
+        }
+        if (matches.isEmpty()) return candidates
+        val bestByIcon = matches.groupBy { it.iconIndex }.mapValues { (_, values) ->
+            values.minWith(compareBy<IconLabelMatch> { it.cost }.thenBy { it.labelIndex })
+        }
+        val bestByLabel = matches.groupBy { it.labelIndex }.mapValues { (_, values) ->
+            values.minWith(compareBy<IconLabelMatch> { it.cost }.thenBy { it.iconIndex })
+        }
+        val reciprocal = bestByIcon.values.filter { match ->
+            bestByLabel[match.labelIndex]?.iconIndex == match.iconIndex
+        }.associateBy { it.iconIndex }
+        if (reciprocal.isEmpty()) return candidates
+        val pairedLabels = reciprocal.values.map { it.labelIndex }.toSet()
+
+        return candidates.mapIndexedNotNull { index, candidate ->
+            when {
+                index in pairedLabels -> null
+                index in reciprocal -> {
+                    val label = candidates[reciprocal.getValue(index).labelIndex]
+                    val union = Rect(candidate.bounds).apply { union(label.bounds) }
+                    mergeCandidatePair(
+                        candidate,
+                        label,
+                        context,
+                        FusionMergeRelation.ICON_LABEL_PAIR,
+                        geometryOwner = candidate,
+                        displayBounds = union,
+                        interactionBounds = candidate.node.interactionBounds ?: candidate.bounds,
+                        forcedText = label.text,
+                        forcedRole = TargetRole.ICON_ENTRY
+                    )
+                }
+                else -> candidate
+            }
+        }
+    }
+
+    private fun isContainedLabelParent(parent: CandidateTarget, label: CandidateTarget): Boolean {
+        if (parent.node.windowId != label.node.windowId) return false
+        val accessibilityStructure = TargetSource.ACCESSIBILITY in parent.sourceSet &&
+            parent.role == TargetRole.UNKNOWN
+        if (!parent.clickable ||
+            (parent.role !in CONTAINED_LABEL_PARENT_ROLES && !accessibilityStructure)
+        ) return false
+        if (parent.bounds.areaLong() <= label.bounds.areaLong()) return false
+        if (parent.sourceSet == setOf(TargetSource.OCR)) return false
+        return overlapOverSmaller(parent.bounds, label.bounds) >= 0.78f
+    }
+
+    private fun shouldKeepIndependentInnerAction(
+        parent: CandidateTarget,
+        label: CandidateTarget,
+        context: TargetFusionContext
+    ): Boolean {
+        val text = normalizedVisualText(label.text.orEmpty())
+        if (!EdgeInteractionRules.isActionableVisualText(text)) return false
+        if (parent.role == TargetRole.LIST_ITEM) return true
+        val compactParent = parent.role in setOf(TargetRole.ACTION, TargetRole.ICON_ENTRY, TargetRole.RIGHT_RAIL) &&
+            parent.bounds.areaLong() <= label.bounds.areaLong() * 6L &&
+            parent.bounds.height() <= context.screenHeight * 0.12f
+        return !compactParent
+    }
+
+    private fun isPairableOcrLabel(candidate: CandidateTarget): Boolean {
+        if (candidate.sourceSet != setOf(TargetSource.OCR)) return false
+        if (candidate.evidence?.directEligible != true) return false
+        val text = normalizedVisualText(candidate.text.orEmpty())
+        return text.isNotBlank() && text.length <= 12 && text.any(Char::isLetter)
+    }
+
+    private fun isPairableIcon(candidate: CandidateTarget): Boolean {
+        if (candidate.role != TargetRole.ICON_ENTRY) return false
+        if (TargetSource.YOLO in candidate.sourceSet || TargetSource.ACCESSIBILITY in candidate.sourceSet) return true
+        val text = normalizedVisualText(candidate.text.orEmpty())
+        return TargetSource.OCR in candidate.sourceSet && text.none(Char::isLetter)
+    }
+
+    private fun iconLabelCost(
+        icon: CandidateTarget,
+        label: CandidateTarget,
+        context: TargetFusionContext
+    ): Float? {
+        if (icon.node.windowId != label.node.windowId) return null
+        val minGap = -dpToPx(4f, context)
+        val maxGap = maxOf(dpToPx(16f, context), (icon.bounds.height() * 0.45f).roundToInt())
+        val verticalGap = label.bounds.top - icon.bounds.bottom
+        if (verticalGap !in minGap..maxGap) return null
+        val centerDelta = abs(icon.bounds.exactCenterX() - label.bounds.exactCenterX())
+        val maxCenterDelta = maxOf(
+            dpToPx(12f, context).toFloat(),
+            maxOf(icon.bounds.width(), label.bounds.width()) * 0.35f
+        )
+        if (centerDelta > maxCenterDelta) return null
+        val union = Rect(icon.bounds).apply { union(label.bounds) }
+        val maxUnionWidth = maxOf(dpToPx(96f, context), (icon.bounds.width() * 2.5f).roundToInt())
+        if (union.width() > maxUnionWidth || union.height() > context.screenHeight * 0.14f) return null
+        return verticalGap.coerceAtLeast(0) / maxGap.toFloat().coerceAtLeast(1f) +
+            centerDelta / maxCenterDelta.coerceAtLeast(1f)
+    }
+
+    private fun semanticLabelScore(text: String): Int {
+        val compact = normalizedVisualText(text)
+        if (compact.isBlank()) return Int.MIN_VALUE
+        var score = 0
+        if (EdgeInteractionRules.isActionableVisualText(compact)) score += 40
+        if (compact.length in 2..8) score += 20
+        if (compact.any(Char::isLetter)) score += 20
+        if (compact.any(Char::isDigit)) score -= 25
+        if (isPriceLikeVisualText(compact)) score -= 60
+        return score
+    }
+
+    private fun CandidateTarget.withMergeRelation(relation: FusionMergeRelation): CandidateTarget {
+        val relations = mergeRelations + relation
+        val updatedEvidence = evidence?.copy(mergeRelations = relations)
+        return copy(
+            node = node.copy(visualEvidence = updatedEvidence),
+            evidence = updatedEvidence,
+            mergeRelations = relations
         )
     }
 
@@ -533,44 +781,110 @@ internal class TargetFusionEngine {
     private fun mergeCandidatePair(
         first: CandidateTarget,
         second: CandidateTarget,
-        context: TargetFusionContext
+        context: TargetFusionContext,
+        relation: FusionMergeRelation = FusionMergeRelation.OVERLAP_DUPLICATE,
+        geometryOwner: CandidateTarget? = null,
+        displayBounds: Rect? = null,
+        interactionBounds: Rect? = null,
+        forcedText: String? = null,
+        forcedRole: TargetRole? = null
     ): CandidateTarget {
         val winner = chooseCandidateWinner(first, second, context)
+        val geometry = geometryOwner ?: chooseGeometryOwner(first, second, winner, relation)
+        val mergedBounds = Rect(displayBounds ?: geometry.bounds)
         val mergedSources = first.sourceSet + second.sourceSet
         val mergedMethod = resolveMergedClickMethod(first, second, winner, mergedSources, context)
+        val mergedRelations = first.mergeRelations + second.mergeRelations + relation
+        val survivorStableId = geometry.node.stableId ?: winner.node.stableId
+        val absorbedStableIds = buildSet {
+            addAll(first.absorbedStableIds)
+            addAll(second.absorbedStableIds)
+            first.node.stableId?.let(::add)
+            second.node.stableId?.let(::add)
+            survivorStableId?.let(::remove)
+        }
+        val mergedText = forcedText ?: chooseMergedText(first, second)
+        val mergedRole = forcedRole ?: geometry.role
+        val yoloEvidence = listOfNotNull(first.evidence, second.evidence)
+            .filter { !it.yoloClass.isNullOrBlank() }
+            .maxByOrNull { it.yoloConfidence ?: 0f }
         val visualEvidence = listOfNotNull(first.evidence, second.evidence)
             .maxByOrNull { it.score }
             ?.copy(
                 sources = mergedSources,
-                ocrText = listOfNotNull(first.evidence?.ocrText, second.evidence?.ocrText)
-                    .minByOrNull { it.length },
+                yoloClass = yoloEvidence?.yoloClass,
+                yoloConfidence = yoloEvidence?.yoloConfidence,
+                ocrText = mergedText,
+                role = mergedRole,
                 clickMethod = mergedMethod,
                 score = maxOf(
                     candidatePriorityHint(first, context),
                     candidatePriorityHint(second, context)
-                )
+                ),
+                directEligible = first.evidence?.directEligible == true || second.evidence?.directEligible == true,
+                mergeRelations = mergedRelations,
+                absorbedStableIds = absorbedStableIds
             )
-        val mergedText = listOfNotNull(
-            first.evidence?.ocrText,
-            second.evidence?.ocrText,
-            first.text,
-            second.text
-        ).filter { it.isNotBlank() }.minByOrNull { it.length }
-        val mergedNode = winner.node.copy(
-            description = mergedText ?: winner.node.description,
+        val resolvedInteractionBounds = Rect(
+            interactionBounds ?: geometry.node.interactionBounds ?: geometry.bounds
+        )
+        val mergedNode = geometry.node.copy(
+            bounds = mergedBounds,
+            centerX = mergedBounds.exactCenterX(),
+            centerY = mergedBounds.exactCenterY(),
+            description = mergedText ?: geometry.node.description,
             clickMethod = mergedMethod,
             sourceSet = mergedSources,
-            visualEvidence = visualEvidence
+            visualEvidence = visualEvidence,
+            stableId = survivorStableId,
+            interactionBounds = resolvedInteractionBounds
         )
-        return winner.copy(
+        return geometry.copy(
             node = mergedNode,
             sourceSet = mergedSources,
+            role = mergedRole,
             text = mergedText,
+            bounds = mergedBounds,
             confidence = maxOf(first.confidence, second.confidence),
             clickable = first.clickable || second.clickable,
             scrollable = first.scrollable || second.scrollable,
             evidence = visualEvidence,
-            clickMethod = mergedMethod
+            clickMethod = mergedMethod,
+            mergeRelations = mergedRelations,
+            absorbedStableIds = absorbedStableIds
+        )
+    }
+
+    private fun chooseGeometryOwner(
+        first: CandidateTarget,
+        second: CandidateTarget,
+        winner: CandidateTarget,
+        relation: FusionMergeRelation
+    ): CandidateTarget {
+        if (relation == FusionMergeRelation.CONTAINED_LABEL) {
+            return if (first.bounds.areaLong() >= second.bounds.areaLong()) first else second
+        }
+        val firstStructural = TargetSource.ACCESSIBILITY in first.sourceSet || TargetSource.YOLO in first.sourceSet
+        val secondStructural = TargetSource.ACCESSIBILITY in second.sourceSet || TargetSource.YOLO in second.sourceSet
+        return when {
+            firstStructural && !secondStructural -> first
+            secondStructural && !firstStructural -> second
+            containsMost(first.bounds, second.bounds, 0.78f) -> first
+            containsMost(second.bounds, first.bounds, 0.78f) -> second
+            else -> winner
+        }
+    }
+
+    private fun chooseMergedText(first: CandidateTarget, second: CandidateTarget): String? {
+        val texts = listOfNotNull(
+            first.evidence?.ocrText,
+            second.evidence?.ocrText,
+            first.text,
+            second.text
+        ).map(::normalizedVisualText).filter(String::isNotBlank).distinct()
+        return texts.maxWithOrNull(
+            compareBy<String> { semanticLabelScore(it) }
+                .thenByDescending { it.length }
         )
     }
 
@@ -630,6 +944,7 @@ internal class TargetFusionEngine {
         context: TargetFusionContext
     ): Boolean {
         if (a.node.windowId != b.node.windowId) return false
+        if (keptInnerActionPair(a.node, b.node)) return false
         val card = when {
             a.role == TargetRole.CARD -> a
             b.role == TargetRole.CARD -> b
@@ -656,6 +971,15 @@ internal class TargetFusionEngine {
             return true
         }
         return false
+    }
+
+    private fun keptInnerActionPair(first: NavNode, second: NavNode): Boolean {
+        val pairs = listOf(first to second, second to first)
+        return pairs.any { (child, parent) ->
+            FusionMergeRelation.KEEP_INNER_ACTION in child.visualEvidence?.mergeRelations.orEmpty() &&
+                parent.bounds.areaLong() > child.bounds.areaLong() * 6L &&
+                containsMost(parent.bounds, child.bounds, 0.78f)
+        }
     }
 
     /**

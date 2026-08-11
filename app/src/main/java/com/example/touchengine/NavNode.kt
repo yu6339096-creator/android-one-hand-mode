@@ -42,7 +42,12 @@ data class NavNode(
      * Accessibility 节点在完整建图提交时补齐；视觉节点由 PersistentVisualCanvas
      * 在首次登记时分配，并在后续扫描、融合和局部更新中持续透传。
      */
-    val stableId: String? = null
+    val stableId: String? = null,
+    /**
+     * Optional physical interaction area. [bounds] remains the visible focus/navigation
+     * geometry while clicks and native-node lookup use this rectangle when present.
+     */
+    val interactionBounds: Rect? = null
 ) {
     val neighbors = mutableListOf<NavNode>()
 }

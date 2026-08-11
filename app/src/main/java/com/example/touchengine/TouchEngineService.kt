@@ -1478,6 +1478,8 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
                 "TouchEngineFinal",
                 "raw=${stats.rawNodeCount} candidates=${stats.candidateCount} final=${stats.finalCount} " +
                     "merged=${stats.mergedCandidateCount} a11y=${stats.accessibilityCount} vision=${stats.visionCount} " +
+                    "contained=${stats.containedLabelMergeCount} iconLabel=${stats.iconLabelPairCount} " +
+                    "keptAction=${stats.keptInnerActionCount} overlap=${stats.overlapDuplicateCount} " +
                     "srcYolo=${stats.yoloInputCount} srcOcr=${stats.ocrInputCount} srcFusion=${stats.fusionInputCount} " +
                     "listIn=${stats.listItemInputCount} listFinal=${stats.listItemFinalCount} page=${stats.pageKey}"
             )
