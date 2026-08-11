@@ -319,10 +319,11 @@ internal class TargetFusionEngine {
         if (bounds.centerX() !in 0..context.screenWidth || bounds.centerY() !in 0..context.screenHeight) return false
         if (isLikelyStatusBarCandidate(bounds, context) || isLikelySystemNavigationCandidate(bounds, context)) return false
         if (isLikelyKeyboardCandidate(bounds, context) || isWithinKeyboardRegion(bounds, context)) return false
-        if (candidate.source != TargetSource.ACCESSIBILITY && overlapsExpandedJoystick(bounds, context)) return false
+        if (candidate.source != TargetSource.ACCESSIBILITY &&
+            overlapsExpandedJoystick(bounds, context) &&
+            !isOverlayTolerantWeChatRow(candidate, context)
+        ) return false
         if (isLikelySelfOverlayText(candidate.text.orEmpty())) return false
-        if (context.useDouyinVideoAccessibility && candidate.source != TargetSource.ACCESSIBILITY) return false
-
         val text = normalizedVisualText(candidate.text.orEmpty())
         if (candidate.source == TargetSource.ACCESSIBILITY) {
             if (text.length > 48 && EdgeInteractionRules.isDouyinPackage(context.targetPackage)) return false
@@ -336,7 +337,10 @@ internal class TargetFusionEngine {
             TargetSource.YOLO !in candidate.sourceSet &&
             TargetSource.VISUAL_FUSION !in candidate.sourceSet &&
             TargetSource.ACCESSIBILITY !in candidate.sourceSet
-        if (isPlainOcrOnly) {
+        val trustedDirectOcr = isPlainOcrOnly &&
+            candidate.role in setOf(TargetRole.ACTION, TargetRole.ICON_ENTRY) &&
+            candidate.evidence?.directEligible == true
+        if (isPlainOcrOnly && !trustedDirectOcr) {
             if (hasGreenParentContainer(candidate, allCandidates)) return false
             if (!shouldPromoteOcrOnlyCandidate(candidate, context)) return false
         }
@@ -482,6 +486,7 @@ internal class TargetFusionEngine {
     ): Boolean {
         if (!EdgeInteractionRules.isDouyinPackage(context.targetPackage)) return false
         if (context.douyinScene == DouyinScene.SEARCH_TEXT) return false
+        if (candidate.evidence?.directEligible == true) return false
         val text = normalizedVisualText(candidate.text.orEmpty())
         if (candidate.role == TargetRole.CARD || candidate.role == TargetRole.LIST_ITEM) return true
         if (text.contains("#") || text.length > 18) return true
@@ -794,13 +799,10 @@ internal class TargetFusionEngine {
         ) {
             score += 8
         }
-        if (candidate.source != TargetSource.ACCESSIBILITY && overlapsExpandedJoystick(candidate.bounds, context)) score -= 80
-        if (EdgeInteractionRules.isDouyinPackage(context.targetPackage) &&
-            context.douyinScene != DouyinScene.SEARCH_TEXT &&
-            candidate.source != TargetSource.ACCESSIBILITY
-        ) {
-            score -= 80
-        }
+        if (candidate.source != TargetSource.ACCESSIBILITY &&
+            overlapsExpandedJoystick(candidate.bounds, context) &&
+            !isOverlayTolerantWeChatRow(candidate, context)
+        ) score -= 80
         return score
     }
 
@@ -821,7 +823,7 @@ internal class TargetFusionEngine {
     }
 
     private fun overlapsExpandedJoystick(bounds: Rect, context: TargetFusionContext): Boolean {
-        val joystickBounds = context.joystickBounds ?: return false
+        val joystickBounds = context.visualOcclusionBounds ?: return false
         val expanded = Rect(joystickBounds).apply {
             inset(-dpToPx(12f, context), -dpToPx(12f, context))
         }
@@ -830,6 +832,24 @@ internal class TargetFusionEngine {
         val overlap = maxOf(0, minOf(bounds.right, expanded.right) - maxOf(bounds.left, expanded.left)).toLong() *
             maxOf(0, minOf(bounds.bottom, expanded.bottom) - maxOf(bounds.top, expanded.top)).toLong()
         return overlap / minArea.toFloat() > 0.18f
+    }
+
+    /**
+     * 微信整行目标由重复头像锚点、OCR 标题与列表结构共同确认。即使整屏回退截图中
+     * 摇杆遮住了行的中部，左侧安全点击区仍然可见且可操作，不应删除整行。小型视觉
+     * 候选和其他应用继续使用原有遮挡过滤，避免把摇杆本身识别成目标。
+     */
+    private fun isOverlayTolerantWeChatRow(
+        candidate: CandidateTarget,
+        context: TargetFusionContext
+    ): Boolean {
+        return context.targetPackage == "com.tencent.mm" &&
+            candidate.role == TargetRole.LIST_ITEM &&
+            TargetSource.OCR in candidate.sourceSet &&
+            TargetSource.VISUAL_FUSION in candidate.sourceSet &&
+            candidate.clickMethod == ClickMethod.GESTURE_SAFE_LEFT &&
+            candidate.bounds.width() >= context.screenWidth * 0.72f &&
+            candidate.bounds.height() <= context.screenHeight * 0.19f
     }
 
     private fun isLikelyKeyboardCandidate(bounds: Rect, context: TargetFusionContext): Boolean {

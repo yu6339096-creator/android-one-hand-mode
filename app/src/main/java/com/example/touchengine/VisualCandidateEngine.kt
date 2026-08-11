@@ -17,14 +17,17 @@ internal data class VisualProcessingContext(
     val screenHeight: Int,
     val density: Float,
     val keyboardTop: Int?,
-    val joystickBounds: Rect?,
+    val visualOcclusionBounds: Rect?,
     val inputMethodVisible: Boolean,
-    val accessibilityNodes: List<NavNode>
+    val accessibilityNodes: List<NavNode>,
+    val douyinScene: DouyinScene = DouyinScene.GENERAL,
+    val regionPolicy: VisualRegionPolicy = VisualRegionPolicy()
 )
 
 internal class VisualCandidateEngine(
     private val context: VisualProcessingContext
 ) {
+    private val TRAILING_ROW_GLYPHS = setOf(">", "›", "→", "»")
     private val STRONG_YOLO_CLASSES = setOf(
         "bottomnavigation",
         "checkbox",
@@ -104,12 +107,12 @@ internal class VisualCandidateEngine(
     /**
      * 微信聊天列表中的一条结构化消息行。
      *
-     * Phase 9B.1：左侧头像/方形图标是稳定的行锚点，中部标题或摘要是必需证据；
-     * 右侧时间只用于增强置信度，不能再作为生成聊天行的硬条件。
+     * Phase 9B.1：左侧头像/方形图标是稳定的行锚点；中部标题与右侧时间用于增强证据。
+     * 页面结构已由其他完整行确认后，允许保留标题被悬浮层遮住的锚点行。
      */
     private data class WeChatMessageRow(
         val centerY: Int,
-        val title: VisualOcrCandidate,
+        val title: VisualOcrCandidate?,
         val timestamp: VisualOcrCandidate?,
         val textEvidence: List<VisualOcrCandidate>,
         val leftAnchor: Rect,
@@ -129,7 +132,7 @@ internal class VisualCandidateEngine(
     }
 
     private fun isLikelySelfOverlayCandidate(bounds: Rect): Boolean {
-        val joystickBounds = context.joystickBounds ?: return false
+        val joystickBounds = context.visualOcclusionBounds ?: return false
         val candidateArea = bounds.areaLong().coerceAtLeast(1L)
         val joystickArea = joystickBounds.areaLong().coerceAtLeast(1L)
         val areaRatio = candidateArea / joystickArea.toFloat()
@@ -152,6 +155,21 @@ internal class VisualCandidateEngine(
             !isLikelySystemNavigationCandidate(bounds) &&
             !inKeyboardRegion &&
             !isLikelySelfOverlayCandidate(bounds)
+    }
+
+    private fun isAllowedByVisualRegion(bounds: Rect): Boolean {
+        val centerX = bounds.centerX()
+        val centerY = bounds.centerY()
+        if (context.douyinScene == DouyinScene.VIDEO_FEED_PORTRAIT &&
+            centerX >= screenWidth * 0.78f &&
+            centerY in (screenHeight * 0.18f).toInt()..(screenHeight * 0.82f).toInt() &&
+            bounds.width() > screenWidth * 0.24f
+        ) {
+            return false
+        }
+        if (context.regionPolicy.blockedRegions.any { it.contains(centerX, centerY) }) return false
+        return context.regionPolicy.allowedRegions.isEmpty() ||
+            context.regionPolicy.allowedRegions.any { it.contains(centerX, centerY) }
     }
 
     internal fun buildNavigationNodes(
@@ -345,6 +363,7 @@ internal class VisualCandidateEngine(
         val direct = buildYoloVisualCandidates(result, cropBounds, targetPackage)
             .asSequence()
             .filter { it.tier == YoloEvidenceTier.ACTION }
+            .filter { isAllowedByVisualRegion(it.bounds) }
             .map { yolo ->
                 VisualOcrCandidate(
                     bounds = Rect(yolo.bounds),
@@ -387,18 +406,27 @@ internal class VisualCandidateEngine(
             .eachCount()
             .maxByOrNull { it.value }
             ?.key ?: 0
-        val direct = candidates.asSequence()
-            .filter { isUsableOcrEvidenceBounds(it.bounds) }
-            .filter { EdgeInteractionRules.isActionableVisualText(it.text) }
-            .map { candidate ->
-                val compact = normalizedVisualText(candidate.text)
+        val admissionPolicy = OcrNavigationAdmissionPolicy()
+        val admissionContext = OcrAdmissionContext(
+            screenWidth = screenWidth,
+            screenHeight = screenHeight,
+            density = context.density,
+            keyboardTop = context.keyboardTop,
+            visualOcclusionBounds = context.visualOcclusionBounds,
+            targetPackage = targetPackage,
+            douyinScene = context.douyinScene,
+            regionPolicy = context.regionPolicy
+        )
+        val rowCandidates = buildTrailingGlyphRowCandidates(candidates)
+        val evaluations = (candidates + rowCandidates).map { candidate ->
+            candidate to admissionPolicy.evaluate(candidate, admissionContext)
+        }
+        val direct = evaluations.asSequence()
+            .filter { (_, admission) -> admission.decision == OcrAdmissionDecision.DIRECT }
+            .map { (candidate, admission) ->
                 candidate.copy(
-                    text = compact,
-                    kind = if (isIconEntryText(compact)) {
-                        VisualCandidateKind.ICON_ENTRY
-                    } else {
-                        VisualCandidateKind.ACTION_TEXT
-                    },
+                    text = admission.normalizedText,
+                    kind = admission.kind,
                     sourceSet = setOf(TargetSource.OCR),
                     evidenceScore = candidate.evidenceScore.coerceAtLeast(70),
                     directEligible = true,
@@ -406,6 +434,13 @@ internal class VisualCandidateEngine(
                 )
             }
             .toList()
+        val decisionSummary = evaluations.groupingBy { it.second.decision }.eachCount()
+        val reasonSummary = evaluations.groupingBy { it.second.reason }.eachCount()
+        Log.d(
+            "TouchEngineOcrAdmission",
+            "pkg=$targetPackage scene=${context.douyinScene} input=${candidates.size} " +
+                "rows=${rowCandidates.size} decisions=$decisionSummary reasons=$reasonSummary direct=${direct.size}"
+        )
         return visualCandidatesToNavNodes(
             finalizeVisualNavigationCandidates(
                 candidates = direct,
@@ -414,6 +449,46 @@ internal class VisualCandidateEngine(
             ),
             primaryWindowId
         )
+    }
+
+    /** A trailing chevron is evidence that its text row is clickable, not a tiny target itself. */
+    private fun buildTrailingGlyphRowCandidates(
+        candidates: List<VisualOcrCandidate>
+    ): List<VisualOcrCandidate> {
+        val chevrons = candidates.filter { normalizedVisualText(it.text) in TRAILING_ROW_GLYPHS }
+        return chevrons.mapNotNull { chevron ->
+            if (chevron.bounds.centerX() < screenWidth * 0.68f) return@mapNotNull null
+            val label = candidates.asSequence()
+                .filter { it !== chevron }
+                .filter { it.bounds.right <= chevron.bounds.left }
+                .filter {
+                    val tolerance = maxOf(it.bounds.height(), chevron.bounds.height()).coerceAtLeast(18)
+                    kotlin.math.abs(it.bounds.centerY() - chevron.bounds.centerY()) <= tolerance
+                }
+                .filter {
+                    val compact = normalizedVisualText(it.text)
+                    compact.length in 2..12 &&
+                        compact !in TRAILING_ROW_GLYPHS &&
+                        !isPriceLikeVisualText(compact)
+                }
+                .maxByOrNull { it.bounds.right }
+                ?: return@mapNotNull null
+            val rowBounds = Rect(label.bounds).apply { union(chevron.bounds) }
+            if (rowBounds.width() >= screenWidth * 0.88f || rowBounds.height() >= screenHeight * 0.13f) {
+                return@mapNotNull null
+            }
+            label.copy(
+                bounds = rowBounds,
+                text = normalizedVisualText(label.text),
+                kind = VisualCandidateKind.ACTION_TEXT,
+                sourceSet = setOf(TargetSource.OCR),
+                evidenceScore = 74,
+                directEligible = true,
+                clickMethod = ClickMethod.GESTURE_CENTER
+            )
+        }.distinctBy {
+            "${it.bounds.left / 8}:${it.bounds.top / 8}:${it.bounds.right / 8}:${it.bounds.bottom / 8}"
+        }
     }
 
     private fun finalizeVisualNavigationCandidates(
@@ -889,6 +964,7 @@ internal class VisualCandidateEngine(
             val tier = yoloEvidenceTier(normalized, detection.confidence, absolute)
             if (tier == YoloEvidenceTier.DEBUG_ONLY) return@mapNotNull null
             if (isLikelySelfOverlayCandidate(absolute)) return@mapNotNull null
+            if (!isAllowedByVisualRegion(absolute)) return@mapNotNull null
             if (!isUsefulYoloTarget(absolute, normalized, targetPackage)) return@mapNotNull null
             val kind = when {
                 normalized == "card" || normalized == "image" -> VisualCandidateKind.CARD_TARGET
@@ -1964,7 +2040,7 @@ internal class VisualCandidateEngine(
                 candidate.bounds.centerX() < screenWidth * 0.72f &&
                     candidate.bounds.left > screenWidth * 0.10f &&
                     compact.length in 1..32
-            } ?: continue
+            }
 
             val timestamp = candidates.asSequence()
                 .filter { candidate ->
@@ -2027,9 +2103,11 @@ internal class VisualCandidateEngine(
             .distinct()
             .count()
         val timestampBackedRows = repeatedRows.count { it.timestamp != null }
-        val pageConfirmed =
+        val titleBackedRows = repeatedRows.count { it.title != null }
+        val pageConfirmed = titleBackedRows >= 2 &&
             (repeatedRows.size >= 2 && headerConfirmed) ||
                 (
+                    titleBackedRows >= 2 &&
                     repeatedRows.size >= 3 &&
                         bottomNavigationCount >= 2 &&
                         timestampBackedRows >= 1
@@ -2039,7 +2117,8 @@ internal class VisualCandidateEngine(
             "TouchEngineWeChat",
             "anchors=${anchors.size} candidateRows=${deduplicated.size} " +
                 "repeatedRows=${repeatedRows.size} header=$headerConfirmed " +
-                "bottomNav=$bottomNavigationCount timestampRows=$timestampBackedRows " +
+                "bottomNav=$bottomNavigationCount titleRows=$titleBackedRows " +
+                "timestampRows=$timestampBackedRows " +
                 "confirmed=$pageConfirmed"
         )
         return if (pageConfirmed) repeatedRows else emptyList()
@@ -2115,7 +2194,7 @@ internal class VisualCandidateEngine(
     }
 
     private fun weChatRowEvidenceScore(row: WeChatMessageRow): Int {
-        return 4 +
+        return (if (row.title != null) 4 else 1) +
             (if (row.timestamp != null) 2 else 0) +
             row.textEvidence.size.coerceAtMost(3)
     }
@@ -2220,8 +2299,15 @@ internal class VisualCandidateEngine(
     }
 
     private fun bestWeChatListItemLabel(row: WeChatMessageRow): String {
-        return normalizedVisualText(row.title.text)
-            .takeIf { it.isNotBlank() }
+        return row.title?.let { normalizedVisualText(it.text) }
+            ?.takeIf { it.isNotBlank() }
+            ?: row.textEvidence.asSequence()
+                .map { normalizedVisualText(it.text) }
+                .firstOrNull {
+                    it.isNotBlank() &&
+                        !isMessageTimestampText(it) &&
+                        !isActionNoiseText(it)
+                }
             ?: "微信聊天项"
     }
 

@@ -78,7 +78,7 @@ internal data class TargetFusionContext(
     val screenHeight: Int,
     val density: Float,
     val keyboardTop: Int?,
-    val joystickBounds: Rect?,
+    val visualOcclusionBounds: Rect?,
     val targetPackage: String?,
     val douyinScene: DouyinScene,
     val useDouyinVideoAccessibility: Boolean

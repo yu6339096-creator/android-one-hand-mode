@@ -110,7 +110,7 @@ internal class OcrEvidenceExtractor {
         bounds: Rect,
         context: OcrExtractionContext
     ): Boolean {
-        val joystickBounds = context.joystickBounds ?: return false
+        val joystickBounds = context.visualOcclusionBounds ?: return false
         val candidateArea = bounds.areaLong().coerceAtLeast(1L)
         val joystickArea = joystickBounds.areaLong().coerceAtLeast(1L)
         val areaRatio = candidateArea / joystickArea.toFloat()

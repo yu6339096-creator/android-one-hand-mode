@@ -12,6 +12,28 @@ internal fun normalizedVisualText(text: String): String {
     return text.trim().replace("\\s+".toRegex(), "")
 }
 
+internal fun visualRegionPolicyFor(
+    scene: DouyinScene,
+    screenWidth: Int,
+    screenHeight: Int
+): VisualRegionPolicy {
+    if (scene != DouyinScene.VIDEO_FEED_PORTRAIT || screenWidth <= 0 || screenHeight <= 0) {
+        return VisualRegionPolicy()
+    }
+    return VisualRegionPolicy(
+        allowedRegions = listOf(
+            Rect(0, 0, screenWidth, (screenHeight * 0.18f).toInt()),
+            Rect(
+                (screenWidth * 0.78f).toInt(),
+                (screenHeight * 0.18f).toInt(),
+                screenWidth,
+                (screenHeight * 0.82f).toInt()
+            ),
+            Rect(0, (screenHeight * 0.82f).toInt(), screenWidth, screenHeight)
+        )
+    )
+}
+
 internal fun isIconEntryText(text: String): Boolean {
     val compact = normalizedVisualText(text)
     return compact.length <= 6 && listOf(
@@ -94,4 +116,3 @@ internal fun intersectionArea(a: Rect, b: Rect): Long {
 internal fun Rect.areaLong(): Long {
     return width().coerceAtLeast(0).toLong() * height().coerceAtLeast(0).toLong()
 }
-

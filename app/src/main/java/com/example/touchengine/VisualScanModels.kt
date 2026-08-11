@@ -17,7 +17,8 @@ internal data class VisualScanRuntime(
     val screenHeight: Int,
     val density: Float,
     val keyboardTop: Int?,
-    val joystickBounds: Rect?,
+    /** 摇杆真实交互范围；只用于交互状态，不代表截图中一定存在遮挡。 */
+    val joystickInteractionBounds: Rect?,
     val inputMethodVisible: Boolean,
     val activeNodes: List<NavNode>,
     val stableNodes: List<NavNode>,
@@ -25,6 +26,36 @@ internal data class VisualScanRuntime(
     val scrollIdle: Boolean,
     val objectEvidenceEnabled: Boolean,
     val yoloInputSize: YoloInputSize
+)
+
+/** 当前帧实际采用的截图来源。 */
+internal enum class VisualCaptureMode {
+    /** Android 14+ 目标应用窗口截图，不包含本服务的无障碍悬浮层。 */
+    WINDOW_CLEAN,
+
+    /** 整个显示屏截图，可能包含本服务的悬浮摇杆。 */
+    DISPLAY_FALLBACK
+}
+
+/** 截图层只依赖这些不可变信息，避免在异步回调中重新猜测目标窗口。 */
+internal data class VisualCaptureRequest(
+    val targetPackage: String?,
+    val primaryWindowId: Int,
+    val requiredBounds: Rect,
+    val screenWidth: Int,
+    val screenHeight: Int
+)
+
+/**
+ * 截图及其屏幕坐标元数据。
+ * [boundsInScreen] 描述 bitmap 左上角在屏幕坐标系中的位置。
+ */
+internal data class VisualScreenshotFrame(
+    val bitmap: Bitmap,
+    val captureMode: VisualCaptureMode,
+    val windowId: Int,
+    val boundsInScreen: Rect,
+    val fallbackReason: String? = null
 )
 
 
@@ -72,6 +103,7 @@ internal data class VisualScanRequest(
     val bandBounds: Map<EdgeInteractionRules.GenericContentBand, Rect>,
     val surfaceKey: VisualSurfaceKey,
     val douyinScene: DouyinScene,
+    val regionPolicy: VisualRegionPolicy = VisualRegionPolicy(),
     val fullScreenTestMode: Boolean
 )
 
@@ -82,7 +114,8 @@ internal data class VisualScanRequest(
  */
 internal interface VisualScreenshotProvider {
     fun capture(
-        onSuccess: (Bitmap) -> Unit,
+        request: VisualCaptureRequest,
+        onSuccess: (VisualScreenshotFrame) -> Unit,
         onFailure: (Int) -> Unit
     )
 }

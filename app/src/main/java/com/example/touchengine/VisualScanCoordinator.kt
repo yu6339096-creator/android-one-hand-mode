@@ -64,6 +64,11 @@ internal class VisualScanCoordinator(
     /** 白纸安装必须串行；否则稍晚到达的 OCR/FUSED 会覆盖尚未提交的 YOLO 直入。 */
     private val installQueue = ArrayDeque<QueuedVisualInstall>()
     private var activeInstall: QueuedVisualInstall? = null
+    private var committedCaptureMode = VisualCaptureMode.DISPLAY_FALLBACK
+
+    /** Service 构建最终融合结果时，使用正在安装批次的截图语义。 */
+    val currentVisualCaptureMode: VisualCaptureMode
+        get() = activeInstall?.pending?.captureMode ?: committedCaptureMode
 
     // Phase 9B.1: once a WeChat message-list scan yields stable rows, retain that
     // geometry briefly for the same page/viewport. This prevents one weak OCR/YOLO
@@ -526,6 +531,7 @@ internal class VisualScanCoordinator(
         scanScheduled = false
         discardQueuedVisualInstalls()
         cache.clear()
+        committedCaptureMode = VisualCaptureMode.DISPLAY_FALLBACK
         clearRetainedWeChatRows()
 
         objectEvidenceGeneration++
@@ -540,32 +546,6 @@ internal class VisualScanCoordinator(
                 preferredDelayMs = SELECTION_RESUME_INITIAL_DELAY_MS
             )
         }
-    }
-
-    fun pauseForDouyinVideo() {
-        advanceSession(VisualCacheInvalidationReason.SURFACE_REPLACED)
-        handler.removeCallbacks(scanRunnable)
-        handler.removeCallbacks(selectionResumeRunnable)
-        scanScheduled = false
-        selectionSuspended = false
-        selectionResumeRequired = false
-        selectionResumeAttempts = 0
-        selectionResumeDelayMs = SELECTION_RESUME_INITIAL_DELAY_MS
-        selectionResumeCause = null
-        generation++
-        activeOcrScanId = null
-        activeProbeScanId = null
-        ocrInFlight = false
-        probeInFlight = false
-        discardQueuedVisualInstalls()
-        cache.clear()
-        clearRetainedWeChatRows()
-        objectEvidenceState.value = ObjectEvidenceDisplay()
-        objectEvidenceGeneration++
-        objectEvidenceInFlight = false
-        clearVisualHoles()
-        visualOcrState.value = VisualOcrDisplay(status = "VISION paused on Douyin video")
-        invalidateActiveVisualNodes()
     }
 
     fun setPausedOnSettings() {
@@ -739,6 +719,7 @@ internal class VisualScanCoordinator(
         val pending = update.pending
         if (candidateGeneration != generation || !isTokenCurrent(pending.token)) return null
         val result = cache.commit(update, selectedFocus) ?: return null
+        committedCaptureMode = pending.captureMode
         result.replacementFocus?.let { /* Service applies it after return. */ }
         // Keep the previous committed green snapshot until the Service publishes the
         // newly committed StableMesh. Pending candidates may update diagnostics/status
@@ -799,14 +780,17 @@ internal class VisualScanCoordinator(
         stage: VisualUpdateStage,
         nodes: List<NavNode>,
         request: VisualScanRequest,
+        captureMode: VisualCaptureMode,
         fingerprints: Map<EdgeInteractionRules.GenericContentBand, Long>,
         reason: VisualCacheInvalidationReason,
         token: VisualScanToken,
         scanGeneration: Int,
         startedAt: Long,
-        textEvidenceCount: Int
+        textEvidenceCount: Int,
+        marqueeObservation: VisualMarqueeGuard.Observation? = null,
+        forceInstall: Boolean = false
     ) {
-        if (nodes.isEmpty() || scanGeneration != generation || !isTokenCurrent(token)) return
+        if ((nodes.isEmpty() && !forceInstall) || scanGeneration != generation || !isTokenCurrent(token)) return
         val candidates = nodes.map { node ->
             val evidence = node.visualEvidence
             VisualOcrCandidate(
@@ -832,6 +816,7 @@ internal class VisualScanCoordinator(
         val pending = PendingVisualCache(
             token = token,
             stage = stage,
+            captureMode = captureMode,
             nodes = nodes,
             candidates = candidates,
             targetPackage = request.runtime.targetPackage,
@@ -843,7 +828,8 @@ internal class VisualScanCoordinator(
             rejectedEvidenceCount = 0,
             elapsedMs = elapsedMs,
             reason = reason,
-            diagnosticSummary = "$stage direct=${nodes.size}"
+            diagnosticSummary = "$stage direct=${nodes.size}",
+            marqueeObservation = marqueeObservation
         )
         Log.d(
             "TouchEngineVision",
@@ -853,15 +839,22 @@ internal class VisualScanCoordinator(
         enqueueVisualInstall(pending, scanGeneration)
     }
 
-    private fun visualContext(runtime: VisualScanRuntime): VisualProcessingContext {
+    private fun visualContext(
+        runtime: VisualScanRuntime,
+        visualOcclusionBounds: Rect?,
+        douyinScene: DouyinScene = DouyinScene.GENERAL,
+        regionPolicy: VisualRegionPolicy = VisualRegionPolicy()
+    ): VisualProcessingContext {
         return VisualProcessingContext(
             screenWidth = runtime.screenWidth,
             screenHeight = runtime.screenHeight,
             density = runtime.density,
             keyboardTop = runtime.keyboardTop,
-            joystickBounds = runtime.joystickBounds?.let { Rect(it) },
+            visualOcclusionBounds = visualOcclusionBounds?.let { Rect(it) },
             inputMethodVisible = runtime.inputMethodVisible,
-            accessibilityNodes = runtime.stableNodes
+            accessibilityNodes = runtime.stableNodes,
+            douyinScene = douyinScene,
+            regionPolicy = regionPolicy
         )
     }
 
@@ -928,10 +921,6 @@ internal class VisualScanCoordinator(
             }
             return
         }
-        if (request.douyinScene == DouyinScene.VIDEO_FEED_PORTRAIT) {
-            pauseForDouyinVideo()
-            return
-        }
         if (ocrInFlight || probeInFlight || cache.pending != null) {
             // A newer valid scan/install is already covering the interrupted request.
             selectionResumeRequired = false
@@ -983,14 +972,21 @@ internal class VisualScanCoordinator(
             }
 
             screenshotProvider.capture(
-                onSuccess = { sourceBitmap ->
+                request = VisualCaptureRequest(
+                    targetPackage = request.runtime.targetPackage,
+                    primaryWindowId = request.runtime.primaryWindowId,
+                    requiredBounds = Rect(request.cropBounds),
+                    screenWidth = request.runtime.screenWidth,
+                    screenHeight = request.runtime.screenHeight
+                ),
+                onSuccess = { frame ->
                     if (!isTokenCurrent(token)) {
-                        sourceBitmap.recycle()
+                        frame.bitmap.recycle()
                         endProbe(token)
                         return@capture
                     }
                     handleScreenshot(
-                        sourceBitmap = sourceBitmap,
+                        frame = frame,
                         request = request,
                         token = token,
                         hadActiveCacheBeforeCapture = hadActiveCacheBeforeCapture
@@ -1017,21 +1013,44 @@ internal class VisualScanCoordinator(
     }
 
     private fun handleScreenshot(
-        sourceBitmap: Bitmap,
+        frame: VisualScreenshotFrame,
         request: VisualScanRequest,
         token: VisualScanToken,
         hadActiveCacheBeforeCapture: Boolean
     ) {
+        val sourceBitmap = frame.bitmap
         if (!isTokenCurrent(token)) {
             sourceBitmap.recycle()
             endProbe(token)
             return
         }
-        val cropBounds = request.cropBounds
-        val cropIsFullScreen = cropBounds.left == 0 &&
-            cropBounds.top == 0 &&
-            cropBounds.width() == sourceBitmap.width &&
-            cropBounds.height() == sourceBitmap.height
+        val cropBounds = Rect(request.cropBounds)
+        if (!cropBounds.intersect(frame.boundsInScreen)) {
+            sourceBitmap.recycle()
+            endProbe(token)
+            Log.d(
+                "TouchEngineVision",
+                "capture has no requested content mode=${frame.captureMode} " +
+                    "frame=${frame.boundsInScreen} requested=${request.cropBounds}"
+            )
+            scheduleScanRetry("captureNoIntersection:${frame.captureMode}")
+            return
+        }
+        val localCropBounds = frameLocalRect(cropBounds, frame)
+        if (localCropBounds == null) {
+            sourceBitmap.recycle()
+            endProbe(token)
+            Log.d(
+                "TouchEngineVision",
+                "capture bounds mismatch mode=${frame.captureMode} frame=${frame.boundsInScreen} crop=$cropBounds"
+            )
+            scheduleScanRetry("captureBoundsMismatch:${frame.captureMode}")
+            return
+        }
+        val cropIsFullScreen = localCropBounds.left == 0 &&
+            localCropBounds.top == 0 &&
+            localCropBounds.width() == sourceBitmap.width &&
+            localCropBounds.height() == sourceBitmap.height
 
         val cropped = try {
             if (cropIsFullScreen) {
@@ -1039,10 +1058,10 @@ internal class VisualScanCoordinator(
             } else {
                 Bitmap.createBitmap(
                     sourceBitmap,
-                    cropBounds.left,
-                    cropBounds.top,
-                    cropBounds.width(),
-                    cropBounds.height()
+                    localCropBounds.left,
+                    localCropBounds.top,
+                    localCropBounds.width(),
+                    localCropBounds.height()
                 )
             }
         } catch (error: Throwable) {
@@ -1057,7 +1076,12 @@ internal class VisualScanCoordinator(
                 request.requestedBands.associateWith { visualHoleFingerprint(cropped) }
             } else {
                 request.requestedBands.associateWith { band ->
-                    val rect = request.bandBounds.getValue(band)
+                    val screenRect = Rect(request.bandBounds.getValue(band))
+                    if (!screenRect.intersect(frame.boundsInScreen)) {
+                        return@associateWith 0L
+                    }
+                    val rect = frameLocalRect(screenRect, frame)
+                        ?: error("band outside capture frame: $screenRect / ${frame.boundsInScreen}")
                     val bandBitmap = Bitmap.createBitmap(
                         sourceBitmap,
                         rect.left,
@@ -1088,6 +1112,16 @@ internal class VisualScanCoordinator(
         }
 
         val targetPackage = request.runtime.targetPackage
+        val visualOcclusionBounds = when (frame.captureMode) {
+            VisualCaptureMode.WINDOW_CLEAN -> null
+            VisualCaptureMode.DISPLAY_FALLBACK ->
+                request.runtime.joystickInteractionBounds?.let { Rect(it) }
+        }
+        Log.d(
+            "TouchEngineVision",
+            "capture mode=${frame.captureMode} window=${frame.windowId} frame=${frame.boundsInScreen} " +
+                "fallback=${frame.fallbackReason ?: "none"} occlusion=${visualOcclusionBounds ?: "none"}"
+        )
         val requestedBands = request.requestedBands
         val surfaceKey = request.surfaceKey
         val hasActiveCache = hadActiveCacheBeforeCapture &&
@@ -1176,16 +1210,19 @@ internal class VisualScanCoordinator(
                 if (scanGeneration != generation || !isTokenCurrent(token, runtime) || runtime.isJoystickSelecting) {
                     return@withContext
                 }
-                val directNodes = VisualCandidateEngine(visualContext(runtime))
+                val directNodes = VisualCandidateEngine(
+                    visualContext(runtime, visualOcclusionBounds, request.douyinScene, request.regionPolicy)
+                )
                     .buildDirectYoloNavigationNodes(
                         result = yoloResult,
-                        cropBounds = request.cropBounds,
+                        cropBounds = cropBounds,
                         targetPackage = request.runtime.targetPackage
                     )
                 enqueueDirectVisualNodes(
                     stage = VisualUpdateStage.DIRECT_YOLO,
                     nodes = directNodes,
                     request = request,
+                    captureMode = frame.captureMode,
                     fingerprints = fingerprints,
                     reason = reason,
                     token = token,
@@ -1202,34 +1239,54 @@ internal class VisualScanCoordinator(
                 screenWidth = request.runtime.screenWidth,
                 screenHeight = request.runtime.screenHeight,
                 keyboardTop = request.runtime.keyboardTop,
-                joystickBounds = request.runtime.joystickBounds?.let { Rect(it) }
+                visualOcclusionBounds = visualOcclusionBounds?.let { Rect(it) },
+                targetPackage = request.runtime.targetPackage,
+                douyinScene = request.douyinScene,
+                regionPolicy = request.regionPolicy
             ),
             onSuccess = { recognition ->
                 val runtime = runCatching { runtimeProvider() }.getOrNull()
                 if (runtime != null && scanGeneration == generation &&
                     isTokenCurrent(token, runtime) && !runtime.isJoystickSelecting
                 ) {
-                    val directNodes = VisualCandidateEngine(visualContext(runtime))
+                    val directNodes = VisualCandidateEngine(
+                        visualContext(runtime, visualOcclusionBounds, request.douyinScene, request.regionPolicy)
+                    )
                         .buildDirectOcrNavigationNodes(
                             candidates = recognition.candidates,
                             targetPackage = request.runtime.targetPackage
                         )
+                    val directDecision = marqueeGuard.evaluate(
+                        token = token,
+                        surfaceKey = request.surfaceKey,
+                        visualNodes = directNodes,
+                        committedNodes = cache.committedNodes,
+                        screenWidth = runtime.screenWidth,
+                        screenHeight = runtime.screenHeight,
+                        density = runtime.density
+                    )
                     enqueueDirectVisualNodes(
                         stage = VisualUpdateStage.DIRECT_OCR,
-                        nodes = directNodes,
+                        nodes = directDecision.nodes,
                         request = request,
+                        captureMode = frame.captureMode,
                         fingerprints = fingerprints,
                         reason = reason,
                         token = token,
                         scanGeneration = scanGeneration,
                         startedAt = startedAt,
-                        textEvidenceCount = recognition.candidates.size
+                        textEvidenceCount = recognition.candidates.size,
+                        marqueeObservation = directDecision.observation,
+                        forceInstall = directDecision.requiresInstall
                     )
                 }
                 handleOcrSuccess(
                     recognition = recognition,
                     cropped = cropped,
                     request = request,
+                    captureMode = frame.captureMode,
+                    visualOcclusionBounds = visualOcclusionBounds,
+                    processedBounds = cropBounds,
                     fingerprints = fingerprints,
                     reason = reason,
                     hasActiveCache = hasActiveCache,
@@ -1248,6 +1305,9 @@ internal class VisualScanCoordinator(
                     ),
                     cropped = cropped,
                     request = request,
+                    captureMode = frame.captureMode,
+                    visualOcclusionBounds = visualOcclusionBounds,
+                    processedBounds = cropBounds,
                     fingerprints = fingerprints,
                     reason = reason,
                     hasActiveCache = hasActiveCache,
@@ -1261,10 +1321,28 @@ internal class VisualScanCoordinator(
         )
     }
 
+    private fun frameLocalRect(
+        screenRect: Rect,
+        frame: VisualScreenshotFrame
+    ): Rect? {
+        if (!frame.boundsInScreen.contains(screenRect)) return null
+        val local = Rect(screenRect).apply {
+            offset(-frame.boundsInScreen.left, -frame.boundsInScreen.top)
+        }
+        return local.takeIf {
+            it.left >= 0 && it.top >= 0 &&
+                it.right <= frame.bitmap.width && it.bottom <= frame.bitmap.height &&
+                it.width() > 0 && it.height() > 0
+        }
+    }
+
     private fun handleOcrSuccess(
         recognition: OcrRecognitionResult,
         cropped: Bitmap,
         request: VisualScanRequest,
+        captureMode: VisualCaptureMode,
+        visualOcclusionBounds: Rect?,
+        processedBounds: Rect,
         fingerprints: Map<EdgeInteractionRules.GenericContentBand, Long>,
         reason: VisualCacheInvalidationReason,
         hasActiveCache: Boolean,
@@ -1318,16 +1396,18 @@ internal class VisualScanCoordinator(
                                 screenHeight = runtime.screenHeight,
                                 density = runtime.density,
                                 keyboardTop = runtime.keyboardTop,
-                                joystickBounds = runtime.joystickBounds?.let { Rect(it) },
+                                visualOcclusionBounds = visualOcclusionBounds?.let { Rect(it) },
                                 inputMethodVisible = runtime.inputMethodVisible,
-                                accessibilityNodes = runtime.stableNodes
+                                accessibilityNodes = runtime.stableNodes,
+                                douyinScene = request.douyinScene,
+                                regionPolicy = request.regionPolicy
                             )
                         )
                         val generatedVisualNodes = visualCandidateEngine.buildNavigationNodes(
                             candidates,
                             request.runtime.targetPackage,
                             cropped,
-                            request.cropBounds,
+                            processedBounds,
                             isUsableBatch,
                             yoloResult
                         )
@@ -1375,7 +1455,7 @@ internal class VisualScanCoordinator(
                         }
                         val visualDiagnostics = visualCandidateEngine.buildDiagnostics(
                             yoloResult,
-                            request.cropBounds,
+                            processedBounds,
                             candidates,
                             shownCandidates,
                             request.runtime.targetPackage
@@ -1410,6 +1490,7 @@ internal class VisualScanCoordinator(
                         } else if (visualNodes.isNotEmpty() || marqueeDecision.requiresInstall) {
                             val pending = PendingVisualCache(
                                 token = token,
+                                captureMode = captureMode,
                                 nodes = visualNodes,
                                 candidates = shownCandidates,
                                 targetPackage = request.runtime.targetPackage,
@@ -1683,6 +1764,7 @@ internal class VisualScanCoordinator(
         probeInFlight = false
         objectEvidenceInFlight = false
         discardQueuedVisualInstalls()
+        committedCaptureMode = VisualCaptureMode.DISPLAY_FALLBACK
         clearRetainedWeChatRows()
         recognizer.close()
     }

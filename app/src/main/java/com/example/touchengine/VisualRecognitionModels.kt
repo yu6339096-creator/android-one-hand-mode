@@ -7,7 +7,10 @@ internal data class OcrExtractionContext(
     val screenWidth: Int,
     val screenHeight: Int,
     val keyboardTop: Int?,
-    val joystickBounds: Rect?
+    val visualOcclusionBounds: Rect?,
+    val targetPackage: String? = null,
+    val douyinScene: DouyinScene = DouyinScene.GENERAL,
+    val regionPolicy: VisualRegionPolicy = VisualRegionPolicy()
 )
 
 internal data class OcrRecognitionResult(

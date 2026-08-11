@@ -9,7 +9,7 @@ import kotlin.math.max
 /**
  * 视觉跑马灯门卫。
  *
- * 只观察 YOLO-only 且 directEligible 的视觉节点。它不截图、不调度模型，
+ * 观察 YOLO-only / OCR-only 且 directEligible 的视觉节点。它不截图、不调度模型，
  * 仅根据已经成功提交的视觉 Mesh 记录同一 surface 内的局部重建风暴；
  * 因此正常视觉目标不会增加首帧延迟。
  */
@@ -66,16 +66,16 @@ internal class VisualMarqueeGuard {
         }
         prune(nowMs)
 
-        val candidates = visualNodes.filter(::isYoloOnlyDirect)
+        val candidates = visualNodes.filter(::isTrackedDirectVisual)
         if (candidates.isEmpty()) {
-            return Decision(visualNodes, observation = null, requiresInstall = false, status = "PASS noYoloOnly")
+            return Decision(visualNodes, observation = null, requiresInstall = false, status = "PASS noTrackedDirect")
         }
 
-        val oldYoloNodes = committedNodes.filter(::isYoloOnlyDirect)
+        val oldDirectNodes = committedNodes.filter(::isTrackedDirectVisual)
         // 只有本轮相对已提交视觉节点发生几何变化的 YOLO 槽位才可计入重建风暴。
         // 否则 OCR 或其它视觉节点的更新会错误地给不变的 YOLO 节点累计次数。
         val changedCandidates = candidates.filter { current ->
-            oldYoloNodes.none { old -> isEquivalentGeometry(current.bounds, old.bounds) }
+            oldDirectNodes.none { old -> isEquivalentObservation(current, old) }
         }
 
         val candidateRegions = clusterRegions(
@@ -113,15 +113,15 @@ internal class VisualMarqueeGuard {
         var retainedSlots = 0
         var removedSlots = 0
         quarantined.forEach { region ->
-            val currentInRegion = output.filter { isYoloOnlyDirect(it) && intersects(region, it.bounds) }
-            val oldInRegion = oldYoloNodes.filter { intersects(region, it.bounds) }
-            if (hasStableSlotGeometry(currentInRegion, oldInRegion)) {
-                output = output.filterNot { isYoloOnlyDirect(it) && intersects(region, it.bounds) } + oldInRegion
+            val currentInRegion = output.filter { isTrackedDirectVisual(it) && intersects(region, it.bounds) }
+            val oldInRegion = oldDirectNodes.filter { intersects(region, it.bounds) }
+            if (hasStableSlotObservations(currentInRegion, oldInRegion)) {
+                output = output.filterNot { isTrackedDirectVisual(it) && intersects(region, it.bounds) } + oldInRegion
                 retainedSlots += oldInRegion.size
             } else {
-                val hadCurrent = output.any { isYoloOnlyDirect(it) && intersects(region, it.bounds) }
+                val hadCurrent = output.any { isTrackedDirectVisual(it) && intersects(region, it.bounds) }
                 val hadOld = oldInRegion.isNotEmpty()
-                output = output.filterNot { isYoloOnlyDirect(it) && intersects(region, it.bounds) }
+                output = output.filterNot { isTrackedDirectVisual(it) && intersects(region, it.bounds) }
                 requiresInstall = requiresInstall || hadCurrent || hadOld
                 removedSlots += oldInRegion.size.coerceAtLeast(if (hadCurrent) 1 else 0)
             }
@@ -208,13 +208,13 @@ internal class VisualMarqueeGuard {
         }
     }
 
-    private fun hasStableSlotGeometry(current: List<NavNode>, old: List<NavNode>): Boolean {
+    private fun hasStableSlotObservations(current: List<NavNode>, old: List<NavNode>): Boolean {
         if (current.isEmpty() || old.isEmpty() || current.size != old.size) return false
         val unmatched = old.toMutableList()
         return current.all { currentNode ->
             val match = unmatched.maxByOrNull { oldNode -> geometryScore(currentNode.bounds, oldNode.bounds) }
                 ?: return@all false
-            if (!isEquivalentGeometry(currentNode.bounds, match.bounds)) return@all false
+            if (!isEquivalentObservation(currentNode, match)) return@all false
             unmatched.remove(match)
             true
         }
@@ -224,9 +224,22 @@ internal class VisualMarqueeGuard {
         return iou(first, second) - edgeDelta(first, second) / 10_000f
     }
 
-    private fun isYoloOnlyDirect(node: NavNode): Boolean {
+    private fun isTrackedDirectVisual(node: NavNode): Boolean {
         val evidence = node.visualEvidence ?: return false
-        return evidence.directEligible && evidence.sources == setOf(TargetSource.YOLO)
+        return evidence.directEligible &&
+            (evidence.sources == setOf(TargetSource.YOLO) || evidence.sources == setOf(TargetSource.OCR))
+    }
+
+    private fun isEquivalentObservation(first: NavNode, second: NavNode): Boolean {
+        if (!isEquivalentGeometry(first.bounds, second.bounds)) return false
+        val firstSources = first.visualEvidence?.sources.orEmpty()
+        val secondSources = second.visualEvidence?.sources.orEmpty()
+        if (firstSources != secondSources) return false
+        if (firstSources == setOf(TargetSource.OCR)) {
+            return normalizedVisualText(first.visualEvidence?.ocrText ?: first.description.orEmpty()) ==
+                normalizedVisualText(second.visualEvidence?.ocrText ?: second.description.orEmpty())
+        }
+        return true
     }
 
     private fun regionsMatch(first: Rect, second: Rect): Boolean {

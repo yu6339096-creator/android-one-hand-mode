@@ -108,6 +108,7 @@ internal data class ObjectEvidenceDisplay(
 internal data class PendingVisualCache(
     val token: VisualScanToken,
     val stage: VisualUpdateStage = VisualUpdateStage.FUSED,
+    val captureMode: VisualCaptureMode = VisualCaptureMode.DISPLAY_FALLBACK,
     val nodes: List<NavNode>,
     val candidates: List<VisualOcrCandidate>,
     val targetPackage: String?,

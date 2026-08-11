@@ -558,31 +558,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
                 blockedRegions = if (top != null) listOf(Rect(0, top - 8, screenWidth, screenHeight)) else emptyList()
             )
         }
-        if (scene != DouyinScene.VIDEO_FEED_PORTRAIT) return VisualRegionPolicy()
-        val topUi = Rect(0, 0, screenWidth, (screenHeight * 0.15f).roundToInt())
-        val rightRail = Rect((screenWidth * 0.78f).roundToInt(), (screenHeight * 0.30f).roundToInt(), screenWidth, (screenHeight * 0.90f).roundToInt())
-        val bottomUi = Rect(0, (screenHeight * 0.88f).roundToInt(), screenWidth, screenHeight)
-        val videoBody = Rect(0, (screenHeight * 0.14f).roundToInt(), (screenWidth * 0.80f).roundToInt(), (screenHeight * 0.88f).roundToInt())
-        val captionBand = Rect(0, (screenHeight * 0.55f).roundToInt(), (screenWidth * 0.82f).roundToInt(), (screenHeight * 0.88f).roundToInt())
-        return VisualRegionPolicy(
-            allowedRegions = listOf(topUi, rightRail, bottomUi),
-            blockedRegions = listOf(videoBody, captionBand)
-        )
-    }
-
-    private fun isAllowedByRegionPolicy(bounds: Rect, policy: VisualRegionPolicy): Boolean {
-        if (policy.blockedRegions.any { blocked ->
-                blocked.contains(bounds.centerX(), bounds.centerY()) ||
-                    containsMost(blocked, bounds, 0.48f)
-            }
-        ) {
-            return false
-        }
-        if (policy.allowedRegions.isEmpty()) return true
-        return policy.allowedRegions.any { allowed ->
-            allowed.contains(bounds.centerX(), bounds.centerY()) ||
-                containsMost(allowed, bounds, 0.45f)
-        }
+        return visualRegionPolicyFor(scene, screenWidth, screenHeight)
     }
 
     private fun isDouyinVideoDeepTarget(node: NavNode): Boolean {
@@ -634,13 +610,6 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
         return EdgeInteractionRules.isDouyinPackage(targetPackage) &&
             classifyDouyinScene(targetPackage) == DouyinScene.VIDEO_FEED_PORTRAIT
     }
-
-    private fun pauseVisualCaptureForDouyinVideo() {
-        visualScanCoordinator.pauseForDouyinVideo()
-        visualHoleState.value = emptyList()
-    }
-
-
 
     private fun isIgnoredWindowEvent(event: AccessibilityEvent): Boolean {
         val eventPackage = event.packageName?.toString()
@@ -1222,7 +1191,6 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
         var candidateNodes = rawNodes
         if (scanPass == MeshScanPass.FAST) {
             if (shouldUseDouyinVideoAccessibility(sampledPackage)) {
-                pauseVisualCaptureForDouyinVideo()
                 val fastVideoNodes = rawNodes.filter(::isDouyinVideoDeepTarget)
                 val deepNodes = if (hasDouyinVideoAccessibilityCoverage(fastVideoNodes)) {
                     emptyList()
@@ -1232,7 +1200,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
                 candidateNodes = mergeNavigationNodes(fastVideoNodes, deepNodes)
                 pendingAnchorScanKey = null
                 pendingHoleBands = emptySet()
-                confirmedHoleBands = emptySet()
+                confirmedHoleBands = EdgeInteractionRules.GenericContentBand.entries.toSet()
                 holeConfirmAttempts.clear()
                 meshHandler.removeCallbacks(anchorScanRunnable)
                 meshHandler.removeCallbacks(holeConfirmRunnable)
@@ -1488,7 +1456,14 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
                 screenHeight = screenHeight,
                 density = resources.displayMetrics.density,
                 keyboardTop = keyboardTop(),
-                joystickBounds = currentJoystickBounds()?.let { Rect(it) },
+                visualOcclusionBounds = if (
+                    ::visualScanCoordinator.isInitialized &&
+                    visualScanCoordinator.currentVisualCaptureMode == VisualCaptureMode.WINDOW_CLEAN
+                ) {
+                    null
+                } else {
+                    currentJoystickBounds()?.let { Rect(it) }
+                },
                 targetPackage = targetPackage,
                 douyinScene = scene,
                 useDouyinVideoAccessibility = shouldUseDouyinVideoAccessibility(targetPackage)
@@ -1738,7 +1713,11 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
             return
         }
         if (shouldUseDouyinVideoAccessibility(targetPackage)) {
-            pauseVisualCaptureForDouyinVideo()
+            val policy = douyinRegionPolicy(DouyinScene.VIDEO_FEED_PORTRAIT)
+            visualHoleState.value = policy.allowedRegions.map(::Rect)
+            if (!isJoystickSelecting && scrollState == ScrollState.IDLE) {
+                visualScanCoordinator.scheduleScan(visualScanCoordinator.scheduleDelayMs())
+            }
             return
         }
         val retainedBands = visualScanCoordinator.retainedBandsFor(targetPackage)
@@ -1772,7 +1751,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
             screenHeight = screenHeight,
             density = resources.displayMetrics.density,
             keyboardTop = keyboardTop(),
-            joystickBounds = currentJoystickBounds()?.let { Rect(it) },
+            joystickInteractionBounds = currentJoystickBounds()?.let { Rect(it) },
             inputMethodVisible = isInputMethodWindowVisible(),
             activeNodes = currentNodes,
             stableNodes = stableMesh?.nodes.orEmpty(),
@@ -1795,15 +1774,27 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
         val targetPackage = runtime.targetPackage
         if (shouldPauseVisualCaptureForPackage(targetPackage)) return null
 
+        val douyinScene = classifyDouyinScene(targetPackage)
+        if (douyinScene == DouyinScene.VIDEO_FEED_PORTRAIT) {
+            val requestedBands = EdgeInteractionRules.GenericContentBand.entries.toSet()
+            return VisualScanRequest(
+                runtime = runtime,
+                requestedBands = requestedBands,
+                cropBounds = Rect(0, 0, screenWidth, screenHeight),
+                bandBounds = requestedBands.associateWith { Rect(0, 0, screenWidth, screenHeight) },
+                surfaceKey = buildVisualSurfaceKey(targetPackage, requestedBands),
+                douyinScene = douyinScene,
+                regionPolicy = douyinRegionPolicy(douyinScene),
+                fullScreenTestMode = FULL_SCREEN_VISUAL_TEST_MODE
+            )
+        }
+
         val retainedBands = visualScanCoordinator.retainedBandsFor(targetPackage)
         val requestedBands = visualRecognitionBands(confirmedHoleBands + retainedBands)
         if (requestedBands.isEmpty()) return null
 
         val holes = visualHoleRects(requestedBands)
         if (holes.isEmpty()) return null
-
-        val douyinScene = classifyDouyinScene(targetPackage)
-        if (douyinScene == DouyinScene.VIDEO_FEED_PORTRAIT) return null
 
         val cropBounds = Rect(holes.first()).also { union ->
             holes.drop(1).forEach { union.union(it) }
@@ -1826,6 +1817,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
             bandBounds = bandBounds,
             surfaceKey = buildVisualSurfaceKey(targetPackage, requestedBands),
             douyinScene = douyinScene,
+            regionPolicy = douyinRegionPolicy(douyinScene),
             fullScreenTestMode = FULL_SCREEN_VISUAL_TEST_MODE
         )
     }
@@ -1833,40 +1825,184 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     private fun createVisualScreenshotProvider(): VisualScreenshotProvider {
         return object : VisualScreenshotProvider {
             override fun capture(
-                onSuccess: (Bitmap) -> Unit,
+                request: VisualCaptureRequest,
+                onSuccess: (VisualScreenshotFrame) -> Unit,
                 onFailure: (Int) -> Unit
             ) {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
                     onFailure(-1)
                     return
                 }
-                takeScreenshot(
-                    Display.DEFAULT_DISPLAY,
-                    mainExecutor,
-                    object : TakeScreenshotCallback {
-                        override fun onSuccess(screenshot: ScreenshotResult) {
-                            val bitmap = try {
-                                Bitmap.wrapHardwareBuffer(
-                                    screenshot.hardwareBuffer,
-                                    screenshot.colorSpace
-                                )?.copy(Bitmap.Config.ARGB_8888, false)
-                            } finally {
-                                screenshot.hardwareBuffer.close()
-                            }
-                            if (bitmap == null) {
-                                onFailure(-2)
-                            } else {
-                                onSuccess(bitmap)
-                            }
-                        }
 
-                        override fun onFailure(errorCode: Int) {
-                            onFailure(errorCode)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    val targetWindow = resolveVisualTargetWindow(request)
+                    if (targetWindow != null) {
+                        try {
+                            takeScreenshotOfWindow(
+                                targetWindow.id,
+                                mainExecutor,
+                                object : TakeScreenshotCallback {
+                                override fun onSuccess(screenshot: ScreenshotResult) {
+                                    val bitmap = screenshotToBitmap(screenshot)
+                                    if (bitmap == null) {
+                                        captureDisplayScreenshot(
+                                            request,
+                                            "windowBitmapNull",
+                                            onSuccess,
+                                            onFailure
+                                        )
+                                        return
+                                    }
+                                    val frameBounds = when {
+                                        bitmap.width == request.screenWidth &&
+                                            bitmap.height == request.screenHeight -> {
+                                            Rect(0, 0, request.screenWidth, request.screenHeight)
+                                        }
+                                        bitmap.width == targetWindow.bounds.width() &&
+                                            bitmap.height == targetWindow.bounds.height() -> {
+                                            Rect(targetWindow.bounds)
+                                        }
+                                        else -> null
+                                    }
+                                    if (frameBounds == null ||
+                                        !Rect.intersects(frameBounds, request.requiredBounds)
+                                    ) {
+                                        val reason = "windowBoundsMismatch:" +
+                                            "bitmap=${bitmap.width}x${bitmap.height},window=${targetWindow.bounds}"
+                                        bitmap.recycle()
+                                        captureDisplayScreenshot(request, reason, onSuccess, onFailure)
+                                        return
+                                    }
+                                    onSuccess(
+                                        VisualScreenshotFrame(
+                                            bitmap = bitmap,
+                                            captureMode = VisualCaptureMode.WINDOW_CLEAN,
+                                            windowId = targetWindow.id,
+                                            boundsInScreen = frameBounds
+                                        )
+                                    )
+                                }
+
+                                override fun onFailure(errorCode: Int) {
+                                    if (shouldPropagateScreenshotFailure(errorCode)) {
+                                        onFailure(errorCode)
+                                    } else {
+                                        captureDisplayScreenshot(
+                                            request,
+                                            "windowError:$errorCode",
+                                            onSuccess,
+                                            onFailure
+                                        )
+                                    }
+                                }
+                                }
+                            )
+                        } catch (error: Throwable) {
+                            captureDisplayScreenshot(
+                                request,
+                                "windowException:${error.javaClass.simpleName}",
+                                onSuccess,
+                                onFailure
+                            )
                         }
+                        return
                     }
+                    captureDisplayScreenshot(
+                        request,
+                        "windowUnavailable",
+                        onSuccess,
+                        onFailure
+                    )
+                    return
+                }
+
+                captureDisplayScreenshot(
+                    request,
+                    "apiBelow34",
+                    onSuccess,
+                    onFailure
                 )
             }
         }
+    }
+
+    private data class VisualTargetWindow(
+        val id: Int,
+        val bounds: Rect
+    )
+
+    /** 只接受本次请求锁定的应用窗口，避免异步期间误截到弹窗或已经切换后的应用。 */
+    private fun resolveVisualTargetWindow(request: VisualCaptureRequest): VisualTargetWindow? {
+        if (request.primaryWindowId < 0 || request.targetPackage.isNullOrBlank()) return null
+        val window = windows?.firstOrNull {
+            it.id == request.primaryWindowId && it.type == AccessibilityWindowInfo.TYPE_APPLICATION
+        } ?: return null
+        val root = window.root ?: return null
+        val windowPackage = try {
+            root.packageName?.toString()
+        } finally {
+            root.recycle()
+        }
+        if (windowPackage == packageName || windowPackage != request.targetPackage) return null
+
+        val bounds = Rect()
+        window.getBoundsInScreen(bounds)
+        if (bounds.width() <= 0 || bounds.height() <= 0 ||
+            !Rect.intersects(bounds, request.requiredBounds)
+        ) {
+            return null
+        }
+        return VisualTargetWindow(window.id, bounds)
+    }
+
+    private fun screenshotToBitmap(screenshot: ScreenshotResult): Bitmap? {
+        return try {
+            Bitmap.wrapHardwareBuffer(
+                screenshot.hardwareBuffer,
+                screenshot.colorSpace
+            )?.copy(Bitmap.Config.ARGB_8888, false)
+        } finally {
+            screenshot.hardwareBuffer.close()
+        }
+    }
+
+    private fun shouldPropagateScreenshotFailure(errorCode: Int): Boolean {
+        return errorCode == AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT ||
+            errorCode == AccessibilityService.ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS
+    }
+
+    private fun captureDisplayScreenshot(
+        request: VisualCaptureRequest,
+        fallbackReason: String,
+        onSuccess: (VisualScreenshotFrame) -> Unit,
+        onFailure: (Int) -> Unit
+    ) {
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            mainExecutor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    val bitmap = screenshotToBitmap(screenshot)
+                    if (bitmap == null) {
+                        onFailure(-2)
+                        return
+                    }
+                    onSuccess(
+                        VisualScreenshotFrame(
+                            bitmap = bitmap,
+                            captureMode = VisualCaptureMode.DISPLAY_FALLBACK,
+                            windowId = request.primaryWindowId,
+                            boundsInScreen = Rect(0, 0, bitmap.width, bitmap.height),
+                            fallbackReason = fallbackReason
+                        )
+                    )
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    onFailure(errorCode)
+                }
+            }
+        )
     }
 
 

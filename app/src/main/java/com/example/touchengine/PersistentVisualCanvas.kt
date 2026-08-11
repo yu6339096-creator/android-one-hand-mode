@@ -164,9 +164,15 @@ internal class PersistentVisualCanvas {
         }
         val incomingNodes = when (pending.stage) {
             VisualUpdateStage.FUSED -> {
-                // 融合结果是这一帧完整的视觉观察；此前的快速层已被它确认或校正。
+                // 融合结果校正同位置的快速节点，但不能删除本帧中未被融合覆盖的可靠
+                // DIRECT_YOLO / DIRECT_OCR 节点。否则关键词直入会在 FUSED 到达时闪退。
+                val trustedDirectNodes = nextDirectObservations.values
+                    .flatten()
+                    .filter { it.visualEvidence?.directEligible == true }
+                val fusedNodes = pending.nodes.filter { it.origin == NavNodeOrigin.VISION }
+                val merged = mergeFusedWithTrustedDirect(fusedNodes, trustedDirectNodes)
                 nextDirectObservations.clear()
-                pending.nodes.filter { it.origin == NavNodeOrigin.VISION }
+                merged
             }
             VisualUpdateStage.DIRECT_YOLO,
             VisualUpdateStage.DIRECT_OCR -> {
@@ -414,6 +420,36 @@ internal class PersistentVisualCanvas {
                 val temporaryStableId = existing.stableId ?: observed.stableId ?: "direct-pending"
                 merged[existingIndex] = mergeMatchedNode(existing, observed, temporaryStableId).let {
                     if (existing.stableId == null && observed.stableId == null) it.copy(stableId = null) else it
+                }
+            }
+        }
+        return merged
+    }
+
+    /**
+     * FUSED 对同一目标拥有最终几何与元数据决定权；没有对应融合目标的可靠快速节点
+     * 则继续保留，体现“先直入、后融合校正”而不是“后融合全量覆盖”。
+     */
+    private fun mergeFusedWithTrustedDirect(
+        fusedNodes: List<NavNode>,
+        trustedDirectNodes: List<NavNode>
+    ): List<NavNode> {
+        val merged = fusedNodes.toMutableList()
+        trustedDirectNodes.forEach { direct ->
+            val existingIndex = merged.indexOfFirst { fused ->
+                matchScore(fused, direct) >= MATCH_THRESHOLD
+            }
+            if (existingIndex < 0) {
+                merged += direct
+            } else {
+                val fused = merged[existingIndex]
+                val temporaryStableId = fused.stableId ?: direct.stableId ?: "fused-pending"
+                merged[existingIndex] = mergeMatchedNode(direct, fused, temporaryStableId).let {
+                    if (fused.stableId == null && direct.stableId == null) {
+                        it.copy(stableId = null)
+                    } else {
+                        it
+                    }
                 }
             }
         }
