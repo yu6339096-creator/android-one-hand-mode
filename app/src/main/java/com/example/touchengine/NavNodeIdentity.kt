@@ -41,6 +41,11 @@ internal object NavNodeIdentity {
             first.interactionBounds == second.interactionBounds
     }
 
+    /** Metadata may converge in Canvas without publishing a new navigation snapshot. */
+    fun sameNavigation(first: NavNode, second: NavNode): Boolean =
+        sameGeometry(first, second) && first.clickMethod == second.clickMethod &&
+            (first.interactionBounds ?: first.bounds) == (second.interactionBounds ?: second.bounds)
+
     fun sameGeometry(first: NavNode, second: NavNode): Boolean {
         return first.windowId == second.windowId && first.bounds == second.bounds
     }

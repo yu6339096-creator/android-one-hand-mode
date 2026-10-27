@@ -2193,11 +2193,12 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
         val baseNodes = baseSnapshot.nodes.filterNot { it.origin == NavNodeOrigin.VISION }
         // 快速路径只把可靠的单源目标补进白纸与导航图；完整融合只在 FUSED 阶段发生。
         val mergedInput = mergeNavigationNodes(baseNodes, canvasUpdate.nodes)
-        val merged = if (effectivePending.stage == VisualUpdateStage.FUSED) {
+        val fused = if (effectivePending.stage == VisualUpdateStage.FUSED) {
             buildFinalTargetNavNodes(mergedInput, effectivePending.targetPackage)
         } else {
             mergedInput
         }
+        val merged = VisualNavigationProjection.project(baseSnapshot.nodes, fused)
         val visualMeshLabel = when (effectivePending.stage) {
             VisualUpdateStage.DIRECT_YOLO -> "StableMesh Direct YOLO"
             VisualUpdateStage.DIRECT_OCR -> "StableMesh Direct OCR"
@@ -2210,25 +2211,14 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
             it.visualEvidence?.role == TargetRole.LIST_ITEM
         }
         val signature = EdgeInteractionRules.meshSignature(merged)
-        val requiresMeshApply = signature != baseSnapshot.signature || !canvasUpdate.patch.isEmpty
+        val requiresMeshApply = !VisualNavigationProjection.sameTargets(baseSnapshot.nodes, merged)
         if (!requiresMeshApply) {
-            val commit = visualScanCoordinator.commitPending(
+            // Commit recognition evidence, but keep Mesh, green boxes and Focus untouched.
+            visualScanCoordinator.commitPending(
                 update = canvasUpdate,
                 candidateGeneration = generation,
                 selectedFocus = currentFocusState.value
             )
-            commit?.replacementFocus?.let { replacement ->
-                currentFocusState.value = NavMeshFocusResolver.reconcile(
-                    previous = replacement,
-                    candidates = navMeshCoordinator.stableSnapshot?.nodes.orEmpty()
-                )
-            }
-            if (commit != null) {
-                visualScanCoordinator.showCommittedMesh(
-                    navMeshCoordinator.stableSnapshot?.nodes.orEmpty(),
-                    visualMeshLabel
-                )
-            }
             onFinished()
             return
         }

@@ -33,8 +33,8 @@ object NavMeshBuilder {
     /**
      * 在不重新执行整张图 O(n²) 建图的前提下应用节点变化。
      *
-     * 算法先复制旧边，再只清理和重算变化节点附近的方向连接；若变化覆盖范围过大、
-     * stableId 匹配率过低或窗口结构明显变化，则自动回退到完整 build，保证正确性。
+     * 算法先复制旧边，再只清理和重算变化节点附近的方向连接。
+     * 变化数量不是场景切换证据；Scene Replace 由上游失效流程决定。
      */
     internal fun applyIncremental(
         existingNodes: List<NavNode>,
@@ -48,7 +48,7 @@ object NavMeshBuilder {
             if (rebuilt.isNotEmpty()) build(rebuilt, maxConnectDist)
             return IncrementalBuildResult(
                 nodes = rebuilt,
-                incremental = false,
+                incremental = existing.isNotEmpty(),
                 affectedNodeCount = rebuilt.size,
                 addedNodeCount = desired.size,
                 updatedNodeCount = 0,
@@ -66,18 +66,6 @@ object NavMeshBuilder {
         }
         val geometryChangedIds = updatedIds.filterTo(linkedSetOf()) { id ->
             !NavNodeIdentity.sameGeometry(oldById.getValue(id), desiredById.getValue(id))
-        }
-
-        val matchRatio = matchedIds.size.toFloat() / max(existing.size, desired.size).coerceAtLeast(1)
-        val windowChanged = existing.map { it.windowId }.toSet() != desired.map { it.windowId }.toSet()
-        if (matchRatio < MIN_STABLE_MATCH_RATIO || windowChanged) {
-            return fullFallback(
-                desired = desired,
-                maxConnectDist = maxConnectDist,
-                addedCount = addedIds.size,
-                updatedCount = updatedIds.size,
-                removedCount = removedIds.size
-            )
         }
 
         val clonedById = desired.associate { node ->
@@ -131,17 +119,6 @@ object NavMeshBuilder {
         }
 
         val affectedDesiredIds = affectedIds intersect desiredById.keys
-        val fallbackThreshold = max(MIN_LOCAL_PATCH_NODE_COUNT, (desired.size * MAX_LOCAL_PATCH_RATIO).toInt())
-        if (affectedDesiredIds.size > fallbackThreshold) {
-            return fullFallback(
-                desired = desired,
-                maxConnectDist = maxConnectDist,
-                addedCount = addedIds.size,
-                updatedCount = updatedIds.size,
-                removedCount = removedIds.size
-            )
-        }
-
         val clonedNodes = desired.map { clonedById.getValue(it.stableId!!) }
         if (affectedDesiredIds.isNotEmpty()) {
             // 删除所有指向受影响节点的旧边，再局部重算，避免旧最近邻残留。
@@ -166,25 +143,6 @@ object NavMeshBuilder {
             addedNodeCount = addedIds.size,
             updatedNodeCount = updatedIds.size,
             removedNodeCount = removedIds.size
-        )
-    }
-
-    private fun fullFallback(
-        desired: List<NavNode>,
-        maxConnectDist: Float,
-        addedCount: Int,
-        updatedCount: Int,
-        removedCount: Int
-    ): IncrementalBuildResult {
-        val rebuilt = desired.map(NavNodeIdentity::cloneWithoutNeighbors)
-        build(rebuilt, maxConnectDist)
-        return IncrementalBuildResult(
-            nodes = rebuilt,
-            incremental = false,
-            affectedNodeCount = rebuilt.size,
-            addedNodeCount = addedCount,
-            updatedNodeCount = updatedCount,
-            removedNodeCount = removedCount
         )
     }
 
@@ -291,8 +249,5 @@ object NavMeshBuilder {
         return reachable.toList()
     }
 
-    private const val MIN_STABLE_MATCH_RATIO = 0.45f
-    private const val MAX_LOCAL_PATCH_RATIO = 0.72f
-    private const val MIN_LOCAL_PATCH_NODE_COUNT = 24
     private const val MIN_LOCAL_IMPACT_RADIUS_PX = 320f
 }

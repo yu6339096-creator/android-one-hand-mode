@@ -350,6 +350,65 @@ class V45VisualNavigationTest {
     }
 
     @Test
+    fun directOcrAndFusionConvergeInCanvasWithoutPublishingMetadata() {
+        val canvas = PersistentVisualCanvas()
+        val original = NavNode(Rect(100, 200, 300, 300), "direct", origin = NavNodeOrigin.VISION,
+            sourceSet = setOf(TargetSource.YOLO))
+        commit(canvas, pending(VisualUpdateStage.DIRECT_YOLO, 1L, listOf(original)))
+        val published = canvas.committedNodes
+        for (stage in listOf(VisualUpdateStage.DIRECT_OCR, VisualUpdateStage.FUSED)) {
+            val observed = original.copy(description = "recognized ${stage.name}",
+                sourceSet = setOf(TargetSource.OCR, TargetSource.VISUAL_FUSION))
+            val next = pending(stage, 1L, listOf(observed))
+            canvas.stage(next)
+            val update = canvas.prepareUpdate(next)!!
+            assertEquals(published.single().stableId, update.nodes.single().stableId)
+            assertFalse(update.patch.isEmpty)
+            assertTrue(VisualNavigationProjection.sameTargets(published,
+                VisualNavigationProjection.project(published, update.nodes)))
+            canvas.commit(update, published.single())!!
+            assertEquals("recognized ${stage.name}", canvas.committedNodes.single().description)
+        }
+    }
+
+    @Test
+    fun fusionAbsorptionCannotMarkItsMatchedSurvivorRemoved() {
+        val canvas = PersistentVisualCanvas()
+        val original = NavNode(Rect(100, 200, 300, 300), "direct", origin = NavNodeOrigin.VISION)
+        commit(canvas, pending(VisualUpdateStage.FUSED, 1L, listOf(original)))
+        val old = canvas.committedNodes.single()
+        val evidence = VisualTargetEvidence(sources = setOf(TargetSource.VISUAL_FUSION),
+            role = TargetRole.ACTION, score = 90, clickMethod = ClickMethod.GESTURE_CENTER,
+            directEligible = false, absorbedStableIds = setOf(old.stableId!!))
+        val next = pending(VisualUpdateStage.FUSED, 2L, listOf(old.copy(visualEvidence = evidence)))
+        canvas.stage(next)
+        val update = canvas.prepareUpdate(next)!!
+        assertEquals(old.stableId, update.nodes.single().stableId)
+        assertTrue(update.patch.removedStableIds.isEmpty())
+    }
+
+    @Test
+    fun fullRefreshRequiresConfirmedDisappearanceWithinSameScene() {
+        val canvas = PersistentVisualCanvas()
+        val node = NavNode(Rect(100, 200, 300, 300), "target", origin = NavNodeOrigin.VISION)
+        commit(canvas, pending(VisualUpdateStage.FUSED, 1L, listOf(node)))
+        commit(canvas, pending(VisualUpdateStage.FUSED, 2L, emptyList(), VisualScanMode.FULL_REFRESH))
+        assertEquals(1, canvas.nodeCount)
+        commit(canvas, pending(VisualUpdateStage.FUSED, 3L, emptyList(), VisualScanMode.FULL_REFRESH))
+        assertEquals(0, canvas.nodeCount)
+    }
+
+    @Test
+    fun realSceneClearDoesNotRetainOldTargets() {
+        val canvas = PersistentVisualCanvas()
+        val node = NavNode(Rect(100, 200, 300, 300), "target", origin = NavNodeOrigin.VISION)
+        commit(canvas, pending(VisualUpdateStage.FUSED, 1L, listOf(node)))
+        canvas.clear()
+        commit(canvas, pending(VisualUpdateStage.FUSED, 2L, emptyList(), VisualScanMode.FULL_REFRESH))
+        assertEquals(0, canvas.nodeCount)
+    }
+
+    @Test
     fun directObservationsKeepOneStableNodeUntilFusionCorrectsIt() {
         val node = buildNodes(
             listOf(YoloDetection("TextButton", 0.05f, RectF(300f, 600f, 620f, 680f)))

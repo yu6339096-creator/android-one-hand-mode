@@ -237,7 +237,7 @@ internal class PersistentVisualCanvas {
 
         previousNodes.forEachIndexed { oldIndex, oldNode ->
             if (oldIndex in oldMatched) {
-                if (oldNode.stableId in explicitlyAbsorbedIds) {
+                if (oldNode.stableId in explicitlyAbsorbedIds && matches.none { it.oldIndex == oldIndex }) {
                     oldNode.stableId?.let(removedIds::add)
                 }
                 return@forEachIndexed
@@ -246,10 +246,9 @@ internal class PersistentVisualCanvas {
             val previousMissed = previousMissingCounts[stableId] ?: 0
             val missed = if (isDirectUpdate) previousMissed else previousMissed + 1
             // 快速路径只补充节点，绝不因为另一条路径尚未到达而删除已有节点。
-            val retainOnce = isDirectUpdate || (
-                pending.token.scanMode != VisualScanMode.FULL_REFRESH &&
-                    missed < MISSING_CONFIRMATION_COUNT
-                )
+            // FULL_REFRESH describes scan coverage, not proof of a scene transition.
+            // Real scene invalidation clears this Canvas before preparing an update.
+            val retainOnce = isDirectUpdate || missed < MISSING_CONFIRMATION_COUNT
             if (retainOnce) {
                 nextNodes += oldNode.copy(
                     bounds = Rect(oldNode.bounds),

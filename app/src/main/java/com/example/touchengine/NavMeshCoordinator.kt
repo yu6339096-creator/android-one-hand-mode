@@ -207,7 +207,7 @@ internal class NavMeshCoordinator(
      * 白纸机制专用提交入口。
      *
      * 与 [submitStableBuild] 不同，本方法会复用当前 StableMesh 的既有边，只重算新增、
-     * 删除或几何变化节点附近的连接。变化范围过大时 NavMeshBuilder 会自动回退完整建图。
+     * 删除或几何变化节点附近的连接。变化数量本身不触发 Scene Replace。
      */
     fun submitStablePatch(
         request: NavMeshBuildRequest,
