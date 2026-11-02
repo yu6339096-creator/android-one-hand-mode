@@ -1,5 +1,6 @@
 package com.example.touchengine // 如果你的包名不一样，记得改这里
 
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -36,6 +37,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -96,11 +100,16 @@ fun MainAppScreen() {
     var isAutoClick by remember {
         mutableStateOf(sharedPrefs.getBoolean("auto_click", false))
     }
+    var showRecognitionBoxes by remember {
+        mutableStateOf(sharedPrefs.getBoolean("show_recognition_boxes", true))
+    }
+    var showAccessibilityGuide by remember { mutableStateOf(false) }
     var objectEvidenceEnabled by remember { mutableStateOf(false) }
     var yoloInputSize by remember {
         mutableStateOf(YoloInputSize.fromPreference(sharedPrefs.getString("yolo_input_size", null)))
     }
     LaunchedEffect(Unit) {
+        TouchEngineService.liveShowRecognitionBoxes.value = showRecognitionBoxes
         TouchEngineService.liveObjectEvidenceEnabled.value = false
         TouchEngineService.liveYoloInputSize.value = yoloInputSize
     }
@@ -126,6 +135,41 @@ fun MainAppScreen() {
         contract = ActivityResultContracts.StartActivityForResult()
     ) {
         isAccessibilityEnabled = isTouchEngineAccessibilityEnabled(context)
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isAccessibilityEnabled = isTouchEngineAccessibilityEnabled(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    if (showAccessibilityGuide) {
+        AccessibilitySetupGuide(
+            strings = strings.accessibilityGuide,
+            appName = context.getString(R.string.app_name),
+            enabled = isAccessibilityEnabled,
+            onDismiss = { showAccessibilityGuide = false },
+            onOpenSettings = {
+                try {
+                    accessibilityLauncher.launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                } catch (_: ActivityNotFoundException) {
+                    Toast.makeText(context, strings.accessibilityGuide.settingsUnavailable, Toast.LENGTH_LONG).show()
+                }
+            },
+            onOpenAppInfo = {
+                try {
+                    accessibilityLauncher.launch(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:${context.packageName}")))
+                } catch (_: ActivityNotFoundException) {
+                    Toast.makeText(context, strings.accessibilityGuide.settingsUnavailable, Toast.LENGTH_LONG).show()
+                }
+            }
+        )
     }
 
     LaunchedEffect(Unit) {
@@ -199,9 +243,7 @@ fun MainAppScreen() {
                     ballOpacity,
                     accentColor,
                     isAccessibilityEnabled,
-                    openAccessibilitySettings = {
-                        accessibilityLauncher.launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                    },
+                    openAccessibilitySettings = { showAccessibilityGuide = true },
                     onRunningChange = {
                         isServiceRunning = it
                         sharedPrefs.edit().putBoolean("service_running", it).apply()
@@ -248,6 +290,13 @@ fun MainAppScreen() {
 
                 // 🚀 将自动开火状态传递给高级设置页面
                 3 -> AdvancedScreen(
+                    showRecognitionBoxes = showRecognitionBoxes,
+                    onShowRecognitionBoxesChange = { visible ->
+                        showRecognitionBoxes = visible
+                        sharedPrefs.edit().putBoolean("show_recognition_boxes", visible).apply()
+                        TouchEngineService.liveShowRecognitionBoxes.value = visible
+                    },
+                    onOpenAccessibilityGuide = { showAccessibilityGuide = true },
                     isEnabled = isServiceRunning,
                     accentColor = accentColor,
                     isAutoClick = isAutoClick,
@@ -321,6 +370,9 @@ fun HomeScreen(
             Spacer(modifier = Modifier.height(16.dp))
         }
 
+        TextButton(onClick = openAccessibilitySettings, modifier = Modifier.fillMaxWidth()) {
+            Text(strings.accessibilityGuide.title)
+        }
         HeroCard(isRunning, accentColor, onRunningChange)
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -390,6 +442,9 @@ fun AppearanceScreen(isEnabled: Boolean, ballSize: Float, ballOpacity: Float, ac
 // ================= 页面 4：高级 =================
 @Composable
 fun AdvancedScreen(
+    showRecognitionBoxes: Boolean,
+    onShowRecognitionBoxesChange: (Boolean) -> Unit,
+    onOpenAccessibilityGuide: () -> Unit,
     isEnabled: Boolean,
     accentColor: Color,
     isAutoClick: Boolean,
@@ -413,6 +468,24 @@ fun AdvancedScreen(
     ) {
         Text(text = strings.advancedTitle, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, color = Color.Black)
         Spacer(modifier = Modifier.height(24.dp))
+
+        Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+            Column(modifier = Modifier.padding(20.dp)) {
+                ToggleRow(
+                    title = strings.recognitionBoxesTitle,
+                    subtitle = strings.recognitionBoxesDescription,
+                    checked = showRecognitionBoxes,
+                    onCheckedChange = onShowRecognitionBoxesChange,
+                    accentColor = accentColor,
+                    enabled = true
+                )
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                TextButton(onClick = onOpenAccessibilityGuide, modifier = Modifier.fillMaxWidth()) {
+                    Text(strings.accessibilityGuide.title)
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
 
         // ── 自动开火 ──────────────────────────────────────
         Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -765,7 +838,7 @@ fun AccessibilityPermissionCard(accentColor: Color, onOpenSettings: () -> Unit) 
                 colors = ButtonDefaults.buttonColors(containerColor = accentColor),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(strings.enableAccessibility)
+                Text(strings.accessibilityGuide.title)
             }
         }
     }

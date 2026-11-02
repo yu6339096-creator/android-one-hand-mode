@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">TouchEngine 流畅度验证</string>
-    <string name="accessibility_service_description">TouchEngine 流畅度验证无障碍服务</string>
+    <string name="accessibility_service_description">识别屏幕上的操作目标，并通过悬浮摇杆执行点击和滑动。</string>
 </resources>

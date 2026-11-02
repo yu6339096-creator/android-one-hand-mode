@@ -98,8 +98,22 @@ internal class TouchEngineUI(private val service: TouchEngineService) {
         var isDraggingWindow by remember { mutableStateOf(false) }
         var edgeTimerJob     by remember { mutableStateOf<Job?>(null) }
         var confirmTimerJob  by remember { mutableStateOf<Job?>(null) }
+        var clickInFlight by remember { mutableStateOf(false) }
         var tapCount         by remember { mutableStateOf(0) }
         var tapTimeoutJob    by remember { mutableStateOf<Job?>(null) }
+
+        LaunchedEffect(TouchEngineService.liveEnabled.value) {
+            if (!TouchEngineService.liveEnabled.value) {
+                tapTimeoutJob?.cancel()
+                confirmTimerJob?.cancel()
+                edgeTimerJob?.cancel()
+                tapCount = 0
+                clickInFlight = false
+                isConfirmPending = false
+                ballOffsetX = 0f
+                ballOffsetY = 0f
+            }
+        }
 
         // ── 动效 ──────────────────────────────────────────
         val baseScale by animateFloatAsState(
@@ -183,7 +197,34 @@ internal class TouchEngineUI(private val service: TouchEngineService) {
         }
 
         // ── 单击 / 双击处理 ──────────────────────────────
-        fun handleTap() {
+        fun handleTap(confirmationTarget: NavNode?) {
+            if (!TouchEngineService.liveEnabled.value || clickInFlight) return
+            if (confirmationTarget != null) {
+                // Confirmation is a single action; do not wait for the Back/Home double-tap timer.
+                tapTimeoutJob?.cancel()
+                confirmTimerJob?.cancel()
+                tapCount = 0
+                clickInFlight = true
+                performClickOnTarget(confirmationTarget) { completed ->
+                    clickInFlight = false
+                    if (completed) {
+                        isConfirmPending = false
+                        currentFocusState.value = null
+                        navEngine.reset()
+                    } else if (currentFocusState.value?.stableId == confirmationTarget.stableId) {
+                        isConfirmPending = true
+                        confirmTimerJob = scope.launch {
+                            delay(3000)
+                            isConfirmPending = false
+                            currentFocusState.value = null
+                        }
+                    } else {
+                        isConfirmPending = false
+                    }
+                }
+                checkAndStartEdgeTimer()
+                return
+            }
             tapCount++
             tapTimeoutJob?.cancel()
             if (tapCount >= 2) {
@@ -194,15 +235,7 @@ internal class TouchEngineUI(private val service: TouchEngineService) {
                 tapTimeoutJob = scope.launch {
                     delay(200)
                     if (tapCount == 1) {
-                        if (isConfirmPending && currentFocusState.value != null) {
-                            performClickOnTarget(currentFocusState.value)
-                            isConfirmPending = false
-                            currentFocusState.value = null
-                            confirmTimerJob?.cancel()
-                            navEngine.reset()
-                            meshHandler.removeCallbacks(meshRunnable)
-                            meshHandler.postDelayed(meshRunnable, 400L)
-                        } else {
+                        if (TouchEngineService.liveEnabled.value) {
                             performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
                         }
                     }
@@ -238,9 +271,12 @@ internal class TouchEngineUI(private val service: TouchEngineService) {
                     },
                     shape = CircleShape
                 )
-                .pointerInput(Unit) {
+                .pointerInput(TouchEngineService.liveEnabled.value) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
+                        if (!TouchEngineService.liveEnabled.value || clickInFlight) return@awaitEachGesture
+                        val confirmationTarget = if (isConfirmPending) currentFocusState.value else null
+                        if (confirmationTarget != null) confirmTimerJob?.cancel()
                         isPressed = true
                         refreshScrollConfig()
                         navEngine.beginGesture(scrollConfig.focusResponseMode)
@@ -479,7 +515,7 @@ internal class TouchEngineUI(private val service: TouchEngineService) {
                                 )
                             }
 
-                            if (dragStarted && !longPressTriggered) {
+                            if (TouchEngineService.liveEnabled.value && dragStarted && !longPressTriggered) {
                                 // ── 摇杆松手 ──────────────────────────────
                                 if (scrollState == ScrollState.PLAN_B) {
                                     stopPlanB() // [FIX 1] 无 scope 参数
@@ -524,7 +560,7 @@ internal class TouchEngineUI(private val service: TouchEngineService) {
                             ballOffsetX = 0f
                             ballOffsetY = 0f
                             if (!dragStarted && !longPressTriggered) {
-                                handleTap()
+                                handleTap(confirmationTarget)
                             }
                             if (longPressTriggered) {
                                 checkAndStartEdgeTimer()

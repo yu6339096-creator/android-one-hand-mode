@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">TouchEngine 動作テスト</string>
+    <string name="accessibility_service_description">画面上の対象を認識し、フローティングジョイスティックでタップやスワイプを実行します。</string>
+</resources>

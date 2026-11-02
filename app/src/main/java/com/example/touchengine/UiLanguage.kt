@@ -24,7 +24,24 @@ enum class AppLanguage(val code: String, val badge: String) {
     }
 }
 
+data class AccessibilityGuideStrings(
+    val title: String,
+    val introduction: String,
+    val steps: List<String>,
+    val enabled: String,
+    val disabled: String,
+    val restrictedTitle: String,
+    val restrictedDescription: String,
+    val openSettings: String,
+    val openAppInfo: String,
+    val close: String,
+    val settingsUnavailable: String
+)
+
 data class UiStrings(
+    val recognitionBoxesTitle: String,
+    val recognitionBoxesDescription: String,
+    val accessibilityGuide: AccessibilityGuideStrings,
     val homeTab: String,
     val modeTab: String,
     val appearanceTab: String,
@@ -89,6 +106,21 @@ data class UiStrings(
         }
 
         private val chinese = UiStrings(
+            recognitionBoxesTitle = "显示识别绿框",
+            recognitionBoxesDescription = "显示当前可选择目标的范围。关闭只隐藏绿框，识别、导航和当前焦点照常工作。",
+            accessibilityGuide = AccessibilityGuideStrings(
+                title = "无障碍开启教程",
+                introduction = "TouchEngine 需要无障碍权限来读取屏幕上的可操作目标，并代你执行点击和滑动。请了解用途后再授权。",
+                steps = listOf("点击下方“打开无障碍设置”。也可以在手机设置中搜索“无障碍”。", "在“已下载的应用”“已安装的服务”或类似列表中，找到“{app}”。不同手机的菜单名称可能不同。", "打开该服务开关，阅读系统说明后确认授权。无需开启 TalkBack 或其他无障碍服务。", "返回 TouchEngine，确认这里显示“无障碍已开启”，再打开首页的总服务开关。拖动摇杆选择目标，松手后单击摇杆确认点击。"),
+                enabled = "无障碍已开启",
+                disabled = "无障碍尚未开启",
+                restrictedTitle = "开关灰色或提示“受限制的设置”？",
+                restrictedDescription = "部分 Android 13 及以上手机会限制通过 APK 安装的应用。仅在确认安装包来自你信任的开发者后，打开本应用的“应用信息”，在右上角菜单中查找“允许受限制的设置”，按系统提示操作，再返回无障碍设置。若没有该选项，请按手机提示处理，不要开启其他无关权限。",
+                openSettings = "打开无障碍设置",
+                openAppInfo = "打开应用信息",
+                close = "关闭教程",
+                settingsUnavailable = "无法打开设置，请在手机设置中搜索“无障碍”。"
+            ),
             homeTab = "首页",
             modeTab = "模式",
             appearanceTab = "外观",
@@ -147,6 +179,21 @@ data class UiStrings(
         )
 
         private val japanese = UiStrings(
+            recognitionBoxesTitle = "認識した対象の緑枠を表示",
+            recognitionBoxesDescription = "現在選択できる対象の範囲を表示します。オフにしても認識・移動・選択中の対象のハイライトは動作します。",
+            accessibilityGuide = AccessibilityGuideStrings(
+                title = "ユーザー補助の設定ガイド",
+                introduction = "TouchEngine はユーザー補助の権限を使い、画面上の操作対象を読み取り、タップやスワイプを実行します。用途を確認してから許可してください。",
+                steps = listOf("下の「ユーザー補助の設定を開く」を押します。端末の設定で「ユーザー補助」を検索することもできます。", "「ダウンロードしたアプリ」「インストール済みサービス」などの一覧で「{app}」を探します。項目名は端末によって異なります。", "このサービスをオンにし、システムの説明を読んで許可します。TalkBack や他のユーザー補助サービスをオンにする必要はありません。", "TouchEngine に戻り、「ユーザー補助は有効です」と表示されることを確認して、ホームのサービススイッチをオンにします。ジョイスティックをドラッグして対象を選び、指を離してからジョイスティックを1回タップして確定します。"),
+                enabled = "ユーザー補助は有効です",
+                disabled = "ユーザー補助はまだ無効です",
+                restrictedTitle = "スイッチが灰色、または「制限付き設定」と表示される場合",
+                restrictedDescription = "Android 13 以降の一部の端末では、APK からインストールしたアプリが制限されます。信頼できる開発者の APK であることを確認した場合のみ、このアプリの「アプリ情報」を開き、右上のメニューから「制限付き設定を許可」を探してください。画面の指示に従った後、ユーザー補助の設定に戻ります。項目がない場合は端末の案内に従い、無関係な権限は許可しないでください。",
+                openSettings = "ユーザー補助の設定を開く",
+                openAppInfo = "アプリ情報を開く",
+                close = "ガイドを閉じる",
+                settingsUnavailable = "設定を開けません。端末の設定で「ユーザー補助」を検索してください。"
+            ),
             homeTab = "ホーム",
             modeTab = "モード",
             appearanceTab = "外観",
@@ -205,6 +252,21 @@ data class UiStrings(
         )
 
         private val english = UiStrings(
+            recognitionBoxesTitle = "Show green target boxes",
+            recognitionBoxesDescription = "Show the bounds of currently selectable targets. Turning this off only hides the green boxes; recognition, navigation and the selected-target highlight keep working.",
+            accessibilityGuide = AccessibilityGuideStrings(
+                title = "Accessibility setup guide",
+                introduction = "TouchEngine uses accessibility access to read actionable items on screen and perform taps and swipes for you. Review this purpose before granting access.",
+                steps = listOf("Tap “Open accessibility settings” below. You can also search for “Accessibility” in your phone’s Settings app.", "Find “{app}” under “Downloaded apps”, “Installed services” or a similar list. Menu names vary by phone.", "Turn on this service and review the system prompt before allowing access. You do not need to enable TalkBack or other accessibility services.", "Return to TouchEngine and check that this guide says “Accessibility is on”. Then turn on the main service switch on Home. Drag the joystick to select a target, release it, then tap the joystick once to confirm."),
+                enabled = "Accessibility is on",
+                disabled = "Accessibility is not enabled yet",
+                restrictedTitle = "Switch disabled or “Restricted settings” shown?",
+                restrictedDescription = "Some phones running Android 13 or later restrict apps installed from APK files. Only if you trust the developer who supplied this APK, open this app’s App info and look for “Allow restricted settings” in the top-right menu. Follow the system prompts, then return to Accessibility settings. If that option is absent, follow your phone’s guidance; do not enable unrelated permissions.",
+                openSettings = "Open accessibility settings",
+                openAppInfo = "Open app info",
+                close = "Close guide",
+                settingsUnavailable = "Could not open settings. Search for “Accessibility” in your phone’s Settings app."
+            ),
             homeTab = "Home",
             modeTab = "Mode",
             appearanceTab = "Appearance",

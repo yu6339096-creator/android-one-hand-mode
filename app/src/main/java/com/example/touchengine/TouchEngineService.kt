@@ -8,6 +8,7 @@ import android.accessibilityservice.AccessibilityService.TakeScreenshotCallback
 import android.accessibilityservice.GestureDescription
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Resources
@@ -50,6 +51,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
         val liveBallSize    = mutableFloatStateOf(0.65f)
         val liveBallOpacity = mutableFloatStateOf(0.80f)
         val liveEnabled     = mutableStateOf(true)
+        val liveShowRecognitionBoxes = mutableStateOf(true)
         val liveObjectEvidenceEnabled = mutableStateOf(false)
         val liveYoloInputSize = mutableStateOf(YoloInputSize.SIZE_640)
         private const val FULL_SCREEN_VISUAL_TEST_MODE = true
@@ -65,6 +67,41 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     // 边缘交互与视觉扫描协程共享该 Service 级 Scope，生命周期与 Service 一致。
     // 不依赖 Compose 的 rememberCoroutineScope，避免重组时后台状态机被意外取消。
     private val serviceScope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+
+    @Volatile private var engineEnabled = false
+    private var engineGeneration = 0
+    private var servicePreferences: SharedPreferences? = null
+    private val servicePreferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (key == "service_running") applyEngineEnabled(prefs.getBoolean(key, true))
+        if (key == "show_recognition_boxes") liveShowRecognitionBoxes.value = prefs.getBoolean(key, true)
+    }
+
+    private fun applyEngineEnabled(enabled: Boolean) {
+        liveEnabled.value = enabled
+        engineEnabled = enabled
+        engineGeneration++
+        foregroundReconcileGeneration++
+        edgeInteractionController.stopContinuousScroll(refreshNodes = false)
+        edgeInteractionController.cancel()
+        meshHandler.removeCallbacksAndMessages(null)
+        pageInvalidationController.reset("serviceToggle")
+        visualScanCoordinator.stop()
+        navMeshCoordinator.clearAll()
+        isJoystickSelecting = false
+        selectionPackage = null
+        pendingRefreshAfterSelection = false
+        currentFocusState.value = null
+        navEngine.reset()
+        resetCapabilityProbes(clearVisibleHoles = false)
+        isWindowSettled = false
+        joystickView?.visibility = if (enabled) View.VISIBLE else View.GONE
+        focusBoxView?.visibility = if (enabled) View.VISIBLE else View.GONE
+        Log.d("TouchEngineService", "engineEnabled=$enabled generation=$engineGeneration")
+        if (enabled) {
+            visualScanCoordinator.prewarm()
+            meshHandler.post { if (engineEnabled) rebuildNavMesh(forceApply = true) }
+        }
+    }
 
     // ── Window ────────────────────────────────────────────
     internal lateinit var windowManager: WindowManager
@@ -114,6 +151,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     internal val meshHandler  = Handler(Looper.getMainLooper())
     internal val meshRunnable = Runnable { rebuildNavMesh() }
     private val anchorScanRunnable = Runnable {
+        if (!engineEnabled) return@Runnable
         if (isJoystickSelecting) {
             deferRefreshUntilSelectionEnds()
         } else {
@@ -190,6 +228,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
         liveBallSize.floatValue    = prefs.getFloat("ball_size", 0.65f)
         liveBallOpacity.floatValue = prefs.getFloat("ball_opacity", 0.80f)
         liveEnabled.value          = prefs.getBoolean("service_running", true)
+        liveShowRecognitionBoxes.value = prefs.getBoolean("show_recognition_boxes", true)
         liveYoloInputSize.value    = YoloInputSize.fromPreference(prefs.getString("yolo_input_size", null))
         navMeshCoordinator = NavMeshCoordinator(
             scope = serviceScope,
@@ -208,7 +247,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
             screenWidth = screenWidth,
             screenHeight = screenHeight,
             configProvider = { scrollConfig },
-            dispatch = { gesture: GestureDescription -> dispatchGesture(gesture, null, null) }
+            dispatch = { gesture: GestureDescription -> engineEnabled && dispatchGesture(gesture, null, null) }
         )
         targetClickExecutor = TargetClickExecutor(
             object : TargetClickExecutor.Host {
@@ -225,8 +264,35 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
                 override fun obtainPrimaryContentRoot(): AccessibilityNodeInfo? =
                     this@TouchEngineService.obtainPrimaryContentRoot()
 
-                override fun dispatchGesture(gesture: GestureDescription): Boolean =
-                    this@TouchEngineService.dispatchGesture(gesture, null, null)
+                override fun dispatchGesture(
+                    gesture: GestureDescription,
+                    onResult: (TargetClickOutcome) -> Unit
+                ): Boolean {
+                    if (!engineEnabled) return false
+                    var finished = false
+                    val timeout = Runnable {
+                        if (!finished) {
+                            finished = true
+                            onResult(TargetClickOutcome.TIMEOUT)
+                        }
+                    }
+                    fun finish(outcome: TargetClickOutcome) {
+                        if (finished) return
+                        finished = true
+                        meshHandler.removeCallbacks(timeout)
+                        onResult(outcome)
+                    }
+                    val accepted = this@TouchEngineService.dispatchGesture(
+                        gesture,
+                        object : GestureResultCallback() {
+                            override fun onCompleted(gestureDescription: GestureDescription) = finish(TargetClickOutcome.COMPLETED)
+                            override fun onCancelled(gestureDescription: GestureDescription) = finish(TargetClickOutcome.CANCELLED)
+                        },
+                        meshHandler
+                    )
+                    if (accepted) meshHandler.postDelayed(timeout, 1_500L)
+                    return accepted
+                }
             }
         )
         edgeInteractionController = EdgeInteractionController(
@@ -291,7 +357,8 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
             requestProvider = ::buildVisualScanRequest,
             installVisualNodes = ::installVisualNodesInStableMesh,
             invalidateActiveVisualNodes = ::stripVisionNodesFromActiveMeshes,
-            clearVisualHoles = { visualHoleState.value = emptyList() }
+            clearVisualHoles = { visualHoleState.value = emptyList() },
+            enabledProvider = { engineEnabled }
         )
         pageInvalidationController = PageInvalidationController(
             handler = meshHandler,
@@ -301,12 +368,19 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
             onDecision = ::handlePageInvalidationDecision
         )
         initFloatingUI()
-        visualScanCoordinator.prewarm()
+        servicePreferences = prefs
+        prefs.registerOnSharedPreferenceChangeListener(servicePreferenceListener)
+        applyEngineEnabled(prefs.getBoolean("service_running", true))
     }
 
     override fun onInterrupt() {}
 
     override fun onDestroy() {
+        engineEnabled = false
+        engineGeneration++
+        servicePreferences?.unregisterOnSharedPreferenceChangeListener(servicePreferenceListener)
+        servicePreferences = null
+        meshHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
         // 先关闭边缘交互状态机，再取消 Service 共享协程。
         if (::edgeInteractionController.isInitialized) {
@@ -772,6 +846,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     }
 
     internal fun refreshAfterSelectionIfNeeded() {
+        if (!engineEnabled) return
         // Phase 8C: visual scan recovery is owned by VisualScanCoordinator and must not
         // depend on accessibility/window events setting pendingRefreshAfterSelection.
         visualScanCoordinator.resumeAfterSelection()
@@ -831,7 +906,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     }
 
     private fun attemptForegroundReconciliation(generation: Int) {
-        if (generation != foregroundReconcileGeneration) return
+        if (!engineEnabled || generation != foregroundReconcileGeneration) return
         if (isJoystickSelecting || scrollState == ScrollState.PLAN_B) {
             postForegroundReconcileRetry(generation, "interactionBusy")
             return
@@ -895,7 +970,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     }
 
     private fun postForegroundReconcileRetry(generation: Int, reason: String) {
-        if (generation != foregroundReconcileGeneration) return
+        if (!engineEnabled || generation != foregroundReconcileGeneration) return
         if (foregroundReconcileAttempt >= foregroundReconcileDelaysMs.lastIndex) {
             Log.w(
                 "TouchEngineSurface",
@@ -986,7 +1061,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     // =====================================================
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
+        if (!engineEnabled || event == null) return
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED &&
             event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED &&
@@ -1166,6 +1241,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
         probeBands: Set<EdgeInteractionRules.GenericContentBand> = emptySet(),
         onDone: ((List<NavNode>) -> Unit)? = null
     ) {
+        if (!engineEnabled) return
         if (isJoystickSelecting) {
             deferRefreshUntilSelectionEnds()
             return
@@ -1545,6 +1621,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     }
 
     private fun handlePageInvalidationDecision(decision: PageInvalidationDecision) {
+        if (!engineEnabled) return
         Log.d(
             "TouchEngineInvalidation",
             "decision=${decision.level} structure=${decision.structuralDistance} " +
@@ -1708,6 +1785,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     }
 
     private fun updateVisualHoleDisplay() {
+        if (!engineEnabled) return
         val targetPackage = activeTargetPackage()
         if (shouldPauseVisualCaptureForPackage(targetPackage)) {
             visualScanCoordinator.setPausedOnSettings()
@@ -1765,6 +1843,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     }
 
     private fun buildVisualScanRequest(): VisualScanRequest? {
+        if (!engineEnabled) return null
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
             isJoystickSelecting ||
             scrollState != ScrollState.IDLE
@@ -2315,6 +2394,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
                     hintData              = scrollHintState.value,
                     visualHoles           = visualHoleState.value,
                     visualOcr             = visualScanCoordinator.visualOcrState.value,
+                    showRecognitionBoxes  = liveShowRecognitionBoxes.value,
                     objectEvidence        = visualScanCoordinator.objectEvidenceState.value,
                     objectEvidenceEnabled = liveObjectEvidenceEnabled.value,
                     scrollConfig          = scrollConfig,
@@ -2350,6 +2430,7 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
     // =====================================================
 
     private fun scheduleLightValidationAfterPotentialPageChange(delayMs: Long = 420L) {
+        if (!engineEnabled) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastLightValidationAtMs < 700L) return
         lastLightValidationAtMs = now
@@ -2365,20 +2446,24 @@ class TouchEngineService : AccessibilityService(), AccessibilityTreeParser.Host 
         }, delayMs)
     }
 
-    internal fun performClickOnTarget(target: NavNode?) {
-        if (target == null) return
-        val result = targetClickExecutor.performClick(target)
-        if (target.origin == NavNodeOrigin.VISION) {
-            visualScanCoordinator.markVisualTapResult(result.clicked)
+    internal fun performClickOnTarget(target: NavNode?, onFinished: (Boolean) -> Unit) {
+        if (!engineEnabled || target == null) {
+            onFinished(false)
+            return
         }
-        Log.d(
-            "TouchEngineClick",
-            "clicked=${result.clicked} method=${result.requestedMethod} path=${result.path} " +
-                "sources=${target.sourceSet.sortedBy { it.name }} origin=${target.origin} " +
-                "x=${result.x} y=${result.y} bounds=${target.bounds} target=${target.description}"
-        )
-        if (result.clicked) {
-            scheduleLightValidationAfterPotentialPageChange()
+        val generation = engineGeneration
+        val targetPackage = activeTargetPackage()
+        Log.d("TouchEngineClick", "request id=${target.stableId} method=${target.clickMethod} bounds=${target.bounds}")
+        targetClickExecutor.performClick(target) { result ->
+            Log.d("TouchEngineClick", "outcome=${result.outcome} method=${result.requestedMethod} path=${result.path} x=${result.x} y=${result.y}")
+            if (!engineEnabled || generation != engineGeneration) return@performClick
+            if (target.origin == NavNodeOrigin.VISION) {
+                visualScanCoordinator.markVisualTapResult(result.clicked)
+            }
+            onFinished(result.clicked)
+            if (result.clicked && targetPackage == activeTargetPackage()) {
+                scheduleLightValidationAfterPotentialPageChange()
+            }
         }
     }
 

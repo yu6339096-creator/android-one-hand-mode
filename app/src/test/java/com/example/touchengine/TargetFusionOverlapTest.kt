@@ -215,7 +215,7 @@ class TargetFusionOverlapTest {
             override val density: Float = 3f
             override fun activeTargetPackage(): String = "com.example.test"
             override fun obtainPrimaryContentRoot(): AccessibilityNodeInfo? = null
-            override fun dispatchGesture(gesture: GestureDescription): Boolean {
+            override fun dispatchGesture(gesture: GestureDescription, onResult: (TargetClickOutcome) -> Unit): Boolean {
                 dispatched = true
                 return true
             }

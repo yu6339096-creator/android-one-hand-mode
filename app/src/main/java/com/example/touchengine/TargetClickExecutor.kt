@@ -14,12 +14,15 @@ internal enum class TargetClickPath {
     NONE
 }
 
+internal enum class TargetClickOutcome { NATIVE_ACCEPTED, DISPATCHED, COMPLETED, CANCELLED, REJECTED, TIMEOUT }
+
 internal data class TargetClickResult(
     val clicked: Boolean,
     val requestedMethod: ClickMethod,
     val path: TargetClickPath,
     val x: Float?,
-    val y: Float?
+    val y: Float?,
+    val outcome: TargetClickOutcome = TargetClickOutcome.NATIVE_ACCEPTED
 )
 
 internal class TargetClickExecutor(
@@ -31,18 +34,18 @@ internal class TargetClickExecutor(
         val density: Float
         fun activeTargetPackage(): String?
         fun obtainPrimaryContentRoot(): AccessibilityNodeInfo?
-        fun dispatchGesture(gesture: GestureDescription): Boolean
+        fun dispatchGesture(gesture: GestureDescription, onResult: (TargetClickOutcome) -> Unit): Boolean
     }
 
-    fun performClick(target: NavNode): TargetClickResult {
+    fun performClick(target: NavNode, onResult: (TargetClickResult) -> Unit = {}): TargetClickResult {
         return when (target.clickMethod) {
-            ClickMethod.ACCESSIBILITY_ACTION -> performAccessibilityClick(target)
+            ClickMethod.ACCESSIBILITY_ACTION -> performAccessibilityClick(target, onResult)
             ClickMethod.GESTURE_CENTER,
-            ClickMethod.GESTURE_SAFE_LEFT -> performGestureClick(target, target.clickMethod)
+            ClickMethod.GESTURE_SAFE_LEFT -> performGestureClick(target, target.clickMethod, onResult = onResult)
         }
     }
 
-    private fun performAccessibilityClick(target: NavNode): TargetClickResult {
+    private fun performAccessibilityClick(target: NavNode, onResult: (TargetClickResult) -> Unit): TargetClickResult {
         val root = host.obtainPrimaryContentRoot()
         val native = root?.let { findNativeNodeByBounds(it, target.interactionBounds ?: target.bounds) }
         try {
@@ -53,7 +56,7 @@ internal class TargetClickExecutor(
                     path = TargetClickPath.NATIVE_ACTION,
                     x = null,
                     y = null
-                )
+                ).also(onResult)
             }
 
             var parent = native?.parent
@@ -69,7 +72,7 @@ internal class TargetClickExecutor(
                             path = TargetClickPath.NATIVE_PARENT_ACTION,
                             x = null,
                             y = null
-                        )
+                        ).also(onResult)
                     }
                     val grandParent = parent.parent
                     parent.recycle()
@@ -84,13 +87,14 @@ internal class TargetClickExecutor(
             root?.recycle()
         }
 
-        return performGestureClick(target, ClickMethod.GESTURE_CENTER, TargetClickPath.GESTURE_FALLBACK)
+        return performGestureClick(target, ClickMethod.GESTURE_CENTER, TargetClickPath.GESTURE_FALLBACK, onResult)
     }
 
     private fun performGestureClick(
         target: NavNode,
         method: ClickMethod,
-        forcedPath: TargetClickPath? = null
+        forcedPath: TargetClickPath? = null,
+        onResult: (TargetClickResult) -> Unit
     ): TargetClickResult {
         val (x, y) = clickPointForTarget(target, method)
         val gesture = GestureDescription.Builder()
@@ -102,18 +106,27 @@ internal class TargetClickExecutor(
                 )
             )
             .build()
-        val clicked = host.dispatchGesture(gesture)
         val path = forcedPath ?: when (method) {
             ClickMethod.GESTURE_SAFE_LEFT -> TargetClickPath.GESTURE_SAFE_LEFT
             else -> TargetClickPath.GESTURE_CENTER
         }
-        return TargetClickResult(
-            clicked = clicked,
+        val pending = TargetClickResult(
+            clicked = false,
             requestedMethod = target.clickMethod,
             path = path,
             x = x,
-            y = y
+            y = y,
+            outcome = TargetClickOutcome.DISPATCHED
         )
+        var delivered = false
+        fun finish(outcome: TargetClickOutcome) {
+            if (delivered) return
+            delivered = true
+            onResult(pending.copy(clicked = outcome == TargetClickOutcome.COMPLETED, outcome = outcome))
+        }
+        val accepted = host.dispatchGesture(gesture, ::finish)
+        if (!accepted) finish(TargetClickOutcome.REJECTED)
+        return if (accepted) pending else pending.copy(outcome = TargetClickOutcome.REJECTED)
     }
 
     private fun clickPointForTarget(target: NavNode, method: ClickMethod): Pair<Float, Float> {

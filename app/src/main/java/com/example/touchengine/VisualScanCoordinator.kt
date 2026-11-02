@@ -33,7 +33,8 @@ internal class VisualScanCoordinator(
     private val requestProvider: () -> VisualScanRequest?,
     private val installVisualNodes: (PendingVisualCache, Int, () -> Unit) -> Unit,
     private val invalidateActiveVisualNodes: () -> Unit,
-    private val clearVisualHoles: () -> Unit
+    private val clearVisualHoles: () -> Unit,
+    private val enabledProvider: () -> Boolean = { true }
 ) {
 
     val visualOcrState = mutableStateOf(VisualOcrDisplay())
@@ -277,7 +278,9 @@ internal class VisualScanCoordinator(
     }
 
     fun prewarm() {
+        if (!enabledProvider()) return
         scope.launch(Dispatchers.Default) {
+            if (!enabledProvider()) return@launch
             try {
                 val result = recognizer.prewarmYolo()
                 Log.d(
@@ -320,6 +323,7 @@ internal class VisualScanCoordinator(
     }
 
     fun scheduleScan(delayMs: Long) {
+        if (!enabledProvider()) return
         if (selectionSuspended) {
             markSelectionResumeRequired(
                 cause = "scheduleScan",
@@ -372,6 +376,7 @@ internal class VisualScanCoordinator(
         clearCapabilityProbes: () -> Unit,
         refreshHoleDisplay: () -> Unit
     ) {
+        if (!enabledProvider()) return
         val runtime = runtimeProvider()
         if (runtime.isJoystickSelecting || selectionSuspended) {
             if (pendingRefreshReason == null) {
@@ -626,6 +631,7 @@ internal class VisualScanCoordinator(
      * accessibility/window event.
      */
     fun resumeAfterSelection(delayMs: Long = SELECTION_RESUME_INITIAL_DELAY_MS): Boolean {
+        if (!enabledProvider()) return false
         selectionSuspended = false
         if (!selectionResumeRequired) {
             handler.removeCallbacks(selectionResumeRunnable)
@@ -887,6 +893,7 @@ internal class VisualScanCoordinator(
     }
 
     fun scanIfIdle() {
+        if (!enabledProvider()) return
         if (selectionSuspended) {
             markSelectionResumeRequired(
                 cause = "scanWhileSuspended",
@@ -1195,6 +1202,7 @@ internal class VisualScanCoordinator(
 
         val startedAt = SystemClock.elapsedRealtime()
         val yoloDeferred: Deferred<Result<YoloUiResult>> = scope.async(Dispatchers.Default) {
+            if (!enabledProvider()) return@async Result.failure(IllegalStateException("engine disabled"))
             val yoloBitmap = cropped.copy(Bitmap.Config.ARGB_8888, false)
             try {
                 runCatching { recognizer.detectYolo(yoloBitmap, request.runtime.yoloInputSize) }
@@ -1372,13 +1380,14 @@ internal class VisualScanCoordinator(
             false
         }
 
-        // 保持原时序：OCR 成功后才启动 YOLO。
+        // OCR 回调后汇合已启动的 YOLO；过期批次也必须安全回收截图。
         scope.launch(Dispatchers.Default) {
             var yoloResult: YoloUiResult? = null
             var yoloError: Throwable? = null
             try {
+                // Always wait for YOLO's bitmap reader before recycling the shared capture.
+                val yoloOutcome = yoloDeferred.await()
                 if (shouldRunYolo) {
-                    val yoloOutcome = yoloDeferred.await()
                     yoloResult = yoloOutcome.getOrNull()
                     yoloError = yoloOutcome.exceptionOrNull()
                 }
@@ -1659,7 +1668,7 @@ internal class VisualScanCoordinator(
         token: VisualScanToken,
         runtime: VisualScanRuntime = runtimeProvider()
     ): Boolean {
-        if (token.scanId < minimumValidScanId ||
+        if (!enabledProvider() || token.scanId < minimumValidScanId ||
             token.pageEpoch != pageEpoch ||
             token.viewportRevision != viewportRevision ||
             token.targetPackage != runtime.targetPackage
@@ -1744,7 +1753,8 @@ internal class VisualScanCoordinator(
             reason == VisualCacheInvalidationReason.AUTO_SCROLL_FINISHED
     }
 
-    fun close() {
+    /** Stop scheduling and expire callbacks. Native inference already running may finish once. */
+    fun stop() {
         handler.removeCallbacks(scanRunnable)
         handler.removeCallbacks(selectionResumeRunnable)
         scanScheduled = false
@@ -1766,6 +1776,15 @@ internal class VisualScanCoordinator(
         discardQueuedVisualInstalls()
         committedCaptureMode = VisualCaptureMode.DISPLAY_FALLBACK
         clearRetainedWeChatRows()
+        cache.clear()
+        pendingRefreshReason = null
+        visualOcrState.value = VisualOcrDisplay()
+        objectEvidenceState.value = ObjectEvidenceDisplay()
+        clearVisualHoles()
+    }
+
+    fun close() {
+        stop()
         recognizer.close()
     }
 

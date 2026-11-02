@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">TouchEngine Performance Test</string>
+    <string name="accessibility_service_description">Recognize on-screen targets and perform taps and swipes using the floating joystick.</string>
+</resources>

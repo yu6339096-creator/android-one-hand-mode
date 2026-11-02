@@ -33,6 +33,7 @@ internal fun FocusHighlightUI(
     hintData: ScrollHintData?,
     visualHoles: List<Rect>,
     visualOcr: VisualOcrDisplay,
+    showRecognitionBoxes: Boolean,
     objectEvidence: ObjectEvidenceDisplay,
     objectEvidenceEnabled: Boolean,
     scrollConfig: ScrollConfig,
@@ -162,7 +163,7 @@ internal fun FocusHighlightUI(
                         .border(1.dp, color.copy(alpha = 0.58f), RoundedCornerShape(3.dp))
                 )
             }
-            visualOcr.candidates.forEach { candidate ->
+            if (showRecognitionBoxes) visualOcr.candidates.forEach { candidate ->
                 val left   = with(density) { candidate.bounds.left.toDp() }
                 val top    = with(density) { (candidate.bounds.top - statusBarHeightPx).toDp() }
                 val width  = with(density) { candidate.bounds.width().toDp() }
